@@ -62,6 +62,10 @@ void launch_sconv_static(const float* x, const void* w, bool w_f32, float* hist,
                          const float* res_add = nullptr, float* pf_scratch = nullptr,
                          bool save_snap = false, float* snap = nullptr, int snap_stride = 0);
 
+void launch_moe_reduce8_sconv_static(const float* pair_out, const void* w, bool w_f32, float* hist, float* out,
+                                     int T, int C, int K_top, float scale, const float* res_add,
+                                     bool save_snap, float* snap, int snap_stride, cudaStream_t s);
+
 void launch_sconv_static_kv(const float* xk, const void* wk, bool wk_f32, float* hk,
                             const float* xv, const void* wv, bool wv_f32, float* hv,
                             int T, int C, float scale, cudaStream_t s, float* pf_scratch = nullptr,
@@ -74,27 +78,27 @@ void launch_sconv_dynamic(const float* x, const float* dyn, const void* static_w
 
 void launch_qkvr_prep(float* q, const float* k, const float* v, float* r,
                       const void* q_scale, const void* r_scale, bool sc_f32,
-                      float* kc, float* vc, int T, int Hq, int Hkv, int D, int d_rel,
+                      void* kc, void* vc, int T, int Hq, int Hkv, int D, int d_rel,
                       int pos0, int kv_cap, bool is_swa, float qk_clip, float r_clip,
                       float v_eps, float log_floor, float log_alpha,
-                      const int32_t* d_pos_ptr, cudaStream_t s);
+                      const int32_t* d_pos_ptr, bool kv_bf16, cudaStream_t s);
 
 void launch_rel_bias(cublasHandle_t cublas, const float* r, const void* rel_proj, bool proj_f32,
                      __nv_bfloat16* r_bf16_scratch, float* rb, int T, int Hq, int d_rel, int extent, cudaStream_t s);
 
-void launch_attn_decode(const float* q, const float* kc, const float* vc, const float* rb,
+void launch_attn_decode(const float* q, const void* kc, const void* vc, const float* rb,
                         const float* sinks, const float* gate, float* part_m, float* part_l, float* part_o,
                         float* out, int pos, int kv_cap, int Hq, int Hkv, int D, int rel_extent,
-                        bool is_swa, int swa, const int32_t* d_pos_ptr, cudaStream_t s);
+                        bool is_swa, int swa, const int32_t* d_pos_ptr, bool kv_bf16, cudaStream_t s);
 
-void launch_attn_verify(const float* q, const float* kc, const float* vc, const float* rb,
+void launch_attn_verify(const float* q, const void* kc, const void* vc, const float* rb,
                         const float* sinks, const float* gate, float* part_m, float* part_l, float* part_o,
                         float* out, int T, int pos0, int kv_cap, int Hq, int Hkv, int D, int rel_extent,
-                        bool is_swa, int swa, const int32_t* d_pos_ptr, cudaStream_t s);
+                        bool is_swa, int swa, const int32_t* d_pos_ptr, bool kv_bf16, cudaStream_t s);
 
-void launch_attn_prefill(const float* q, const float* kc, const float* vc, const float* rb,
+void launch_attn_prefill(const float* q, const void* kc, const void* vc, const float* rb,
                          const float* sinks, const float* gate, float* out, int T, int pos0, int kv_cap,
-                         int Hq, int Hkv, int D, int rel_extent, bool is_swa, int swa, cudaStream_t s);
+                         int Hq, int Hkv, int D, int rel_extent, bool is_swa, int swa, bool kv_bf16, cudaStream_t s);
 
 void launch_moe_route(const float* logits, const void* bias, bool bias_f32, uint32_t* eid, float* ew,
                       int T, int E, int K, float route_scale, cudaStream_t s);
@@ -107,17 +111,22 @@ struct MoeGroupBufs {
   int32_t* num_tiles;
 };
 
+void launch_moe_route_bucket_small(const float* logits, const void* bias, bool bias_f32, uint32_t* eid, float* ew,
+                                   const MoeGroupBufs* gbuf, int T, int E, int K, float route_scale, cudaStream_t s);
+
 void launch_moe_nvfp4(const float* x, const uint32_t* eid, const float* ew,
                       const uint8_t* w13, const uint8_t* w13_sc, const float* w13_outer,
                       const uint8_t* w2, const uint8_t* w2_sc, const float* w2_outer,
                       float* act_scratch, float* pair_out, float* out, int T, int H, int I, int K_top,
-                      const MoeGroupBufs* gbuf, int n_experts, cudaStream_t s);
+                      const MoeGroupBufs* gbuf, int n_experts, cudaStream_t s,
+                      bool run_reduce8 = true, bool pre_bucketed = false);
 
 void launch_moe_mxfp8(const float* x, const uint32_t* eid, const float* ew,
                       const uint8_t* w13, const uint8_t* w13_sc,
                       const uint8_t* w2, const uint8_t* w2_sc,
                       float* act_scratch, float* pair_out, float* out, int T, int H, int I, int K_top,
-                      const MoeGroupBufs* gbuf, int n_experts, cudaStream_t s);
+                      const MoeGroupBufs* gbuf, int n_experts, cudaStream_t s,
+                      bool run_reduce8 = true, bool pre_bucketed = false);
 
 void launch_add(const float* src, float* dst, int n, cudaStream_t s);
 void launch_add3(const float* a, const float* b, float* dst, int n, cudaStream_t s);
@@ -137,13 +146,14 @@ void launch_mtp_prep_block(const int32_t* d_anchor_tok, const __nv_bfloat16* emb
                            float* out, int B, int H, float eps, cudaStream_t s);
 
 void launch_mtp_qk_rope_cache(float* q, float* k, const float* v, const __nv_bfloat16* q_norm,
-                               const __nv_bfloat16* k_norm, float* kc, float* vc,
+                               const __nv_bfloat16* k_norm, void* kc, void* vc,
                                int T, int Hq, int Hkv, int D, int pos0, const int32_t* d_pos_ptr,
-                               int kv_cap, bool is_swa, bool draft_mode, float eps, float theta, cudaStream_t s);
+                               int kv_cap, bool is_swa, bool draft_mode, float eps, float theta,
+                               bool kv_bf16, cudaStream_t s);
 
-void launch_mtp_attn(const float* q, const float* kc, const float* vc, const float* k_blk, const float* v_blk,
+void launch_mtp_attn(const float* q, const void* kc, const void* vc, const float* k_blk, const float* v_blk,
                      float* out, int B, int P, const int32_t* d_pos_ptr, int kv_cap, int Hq, int Hkv, int D,
-                     bool is_swa, int swa, cudaStream_t s);
+                     bool is_swa, int swa, bool kv_bf16, cudaStream_t s);
 
 void launch_mtp_gate_up_swiglu(const float* x, const __nv_bfloat16* gate_up_w, float* out,
                                int M, int F, int H, cudaStream_t s);
@@ -215,6 +225,11 @@ void launch_sconv_static_tree(const float* x, const void* w, bool w_f32, const f
                               const int8_t* p2, const int8_t* p3, int M, int C, float scale, const float* res_add,
                               cudaStream_t s);
 
+void launch_moe_reduce8_sconv_static_tree(const float* pair_out, const void* w, bool w_f32, const float* hist,
+                                          float* out, float* stage_raw, int stage_stride, int stage_ch_off,
+                                          const int8_t* p1, const int8_t* p2, const int8_t* p3,
+                                          int M, int C, int K_top, float scale, const float* res_add, cudaStream_t s);
+
 void launch_sconv_static_kv_tree(float* xk, const void* wk, bool wk_f32, const float* hk,
                                  float* xv, const void* wv, bool wv_f32, const float* hv,
                                  float* stage_raw, int stage_stride, const int8_t* p1, const int8_t* p2,
@@ -232,19 +247,19 @@ void launch_qkvr_prep_tree(float* q, const float* k, const float* v, float* r,
                            float qk_clip, float r_clip, float v_eps, float log_floor, float log_alpha,
                            bool is_swa, cudaStream_t s);
 
-void launch_attn_tree(const float* q, const float* kc, const float* vc, const float* stage_k, const float* stage_v,
+void launch_attn_tree(const float* q, const void* kc, const void* vc, const float* stage_k, const float* stage_v,
                       const float* rb, const float* sinks, const float* gate, float* part_m, float* part_l,
                       float* part_o, float* out, int M, int pos0, const int32_t* d_pos_ptr, const uint8_t* d_depth,
                       const uint32_t* d_anc_mask, int kv_cap, int Hq, int Hkv, int D, int rel_extent, bool is_swa,
-                      int swa, cudaStream_t s);
+                      int swa, bool kv_bf16, cudaStream_t s);
 
 void launch_commit_sconv_all48(float* d_conv_base, const float* d_stage_sconv, const int32_t* d_path, int n_acc,
                                int nv, int tree_cap, int KVD, int H, cudaStream_t s);
 
-void launch_commit_kv_all48(float* const* d_kc_ptrs, float* const* d_vc_ptrs, const int32_t* d_kv_cap,
+void launch_commit_kv_all48(void* const* d_kc_ptrs, void* const* d_vc_ptrs, const int32_t* d_kv_cap,
                             const uint8_t* d_kv_is_swa, const float* d_stage_k, const float* d_stage_v,
                             const int32_t* d_path, int p0, int n_acc, int nv, int tree_cap, int Hkv, int D,
-                            cudaStream_t s);
+                            bool kv_bf16, cudaStream_t s);
 
 void launch_compact_taps(float* t0, float* t1, float* t2, float* t3, float* scratch, const int32_t* d_path,
                          int n_acc, int H, cudaStream_t s);

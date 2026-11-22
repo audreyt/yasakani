@@ -553,7 +553,13 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   }
   if (const char* emx = std::getenv("YSKN_INK2_TREE_MAX")) {
     const int m = std::atoi(emx);
-    if (m >= 3) tree_max_ = std::min(kMaxTree, m);
+    if (m >= 2) tree_max_ = std::min(kMaxTree, m);
+  }
+  if (const char* ekv = std::getenv("YSKN_INK2_KV")) {
+    kv_bf16_ = (std::strcmp(ekv, "bf16") == 0 || std::strcmp(ekv, "BF16") == 0 || std::strcmp(ekv, "1") == 0);
+  }
+  if (const char* esuf = std::getenv("YSKN_INK2_SUFFIX_DRAFT")) {
+    use_suffix_draft_ = (std::strcmp(esuf, "0") != 0);
   }
 
   DevGuard tmp_u_bf16;
@@ -787,9 +793,10 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   }
   reader.close_all();
 
-  // KV caches (FP32 for exact parity) & contiguous short-conv history across 48 visits
+  // KV caches (FP32 default, BF16 opt-in via YSKN_INK2_KV=bf16) & contiguous short-conv history across 48 visits
   const size_t nv = cfg_.schedule.size();
   const size_t kv_row_elems = size_t(cfg_.hkv) * size_t(cfg_.head_dim);
+  const size_t kv_eb = kv_bf16_ ? sizeof(__nv_bfloat16) : sizeof(float);
   d_kc_.resize(nv);
   d_vc_.resize(nv);
   d_conv_.resize(nv);
@@ -797,8 +804,8 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   for (size_t v = 0; v < nv; ++v) {
     const int ip = cfg_.schedule[v];
     const size_t cap = cfg_.is_local[size_t(ip)] ? size_t(ring_rows_) : size_t(max_ctx_);
-    d_kc_[v] = static_cast<float*>(alloc_gpu(cap * kv_row_elems * sizeof(float)));
-    d_vc_[v] = static_cast<float*>(alloc_gpu(cap * kv_row_elems * sizeof(float)));
+    d_kc_[v] = alloc_gpu(cap * kv_row_elems * kv_eb);
+    d_vc_[v] = alloc_gpu(cap * kv_row_elems * kv_eb);
     d_conv_[v] = d_conv_base_ + v * size_t(kVisitConvFloats);
   }
   d_verify_conv_ = static_cast<float*>(alloc_gpu(size_t(kMtpBlock) * nv * size_t(kVisitConvFloats) * sizeof(float)));
@@ -1088,10 +1095,11 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     // MTP context KV caches & draft scratch buffers
     const size_t mb = size_t(mtp_cfg_.block);
     const size_t mtp_kv_row = size_t(MKVD);
+    const size_t mtp_kv_eb = kv_bf16_ ? sizeof(__nv_bfloat16) : sizeof(float);
     for (int i = 0; i < 3; ++i) {
       const size_t cap = mtp_cfg_.is_local[i] ? size_t(ring_rows_) : size_t(max_ctx_);
-      d_mtp_kc_[i] = static_cast<float*>(alloc_gpu(cap * mtp_kv_row * sizeof(float)));
-      d_mtp_vc_[i] = static_cast<float*>(alloc_gpu(cap * mtp_kv_row * sizeof(float)));
+      d_mtp_kc_[i] = alloc_gpu(cap * mtp_kv_row * mtp_kv_eb);
+      d_mtp_vc_[i] = alloc_gpu(cap * mtp_kv_row * mtp_kv_eb);
     }
     d_mtp_rec_feat_ = static_cast<float*>(alloc_gpu(size_t(MH) * sizeof(float)));
     d_mtp_ctx_h_ = static_cast<float*>(alloc_gpu(T * size_t(MH) * sizeof(float)));
@@ -1156,11 +1164,11 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
       d_tree_anc_mask_ = static_cast<uint32_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(uint32_t)));
       d_acc_path_ = static_cast<int32_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(int32_t)));
 
-      d_kc_ptrs_ = static_cast<float**>(alloc_gpu(nv_t * sizeof(float*)));
-      d_vc_ptrs_ = static_cast<float**>(alloc_gpu(nv_t * sizeof(float*)));
+      d_kc_ptrs_ = static_cast<void**>(alloc_gpu(nv_t * sizeof(void*)));
+      d_vc_ptrs_ = static_cast<void**>(alloc_gpu(nv_t * sizeof(void*)));
       d_kv_cap_ = static_cast<int32_t*>(alloc_gpu(nv_t * sizeof(int32_t)));
       d_kv_is_swa_ = static_cast<uint8_t*>(alloc_gpu(nv_t * sizeof(uint8_t)));
-      std::vector<float*> kc_h(nv_t), vc_h(nv_t);
+      std::vector<void*> kc_h(nv_t), vc_h(nv_t);
       std::vector<int32_t> kv_cap_h(nv_t);
       std::vector<uint8_t> kv_swa_h(nv_t);
       for (size_t v_i = 0; v_i < nv_t; ++v_i) {
@@ -1170,8 +1178,8 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
         kv_cap_h[v_i] = is_s ? ring_rows_ : max_ctx_;
         kv_swa_h[v_i] = is_s ? 1 : 0;
       }
-      cuda_ok(cudaMemcpyAsync(d_kc_ptrs_, kc_h.data(), nv_t * sizeof(float*), cudaMemcpyHostToDevice, stream_), "kc ptrs");
-      cuda_ok(cudaMemcpyAsync(d_vc_ptrs_, vc_h.data(), nv_t * sizeof(float*), cudaMemcpyHostToDevice, stream_), "vc ptrs");
+      cuda_ok(cudaMemcpyAsync(d_kc_ptrs_, kc_h.data(), nv_t * sizeof(void*), cudaMemcpyHostToDevice, stream_), "kc ptrs");
+      cuda_ok(cudaMemcpyAsync(d_vc_ptrs_, vc_h.data(), nv_t * sizeof(void*), cudaMemcpyHostToDevice, stream_), "vc ptrs");
       cuda_ok(cudaMemcpyAsync(d_kv_cap_, kv_cap_h.data(), nv_t * sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "kv cap");
       cuda_ok(cudaMemcpyAsync(d_kv_is_swa_, kv_swa_h.data(), nv_t * sizeof(uint8_t), cudaMemcpyHostToDevice, stream_), "kv swa");
       cuda_ok(cudaStreamSynchronize(stream_), "sync tree tables");
@@ -1309,6 +1317,7 @@ void EngineInk2::set_suppress(const int32_t* token_ids, int n_tokens) {
   const size_t V = size_t(cfg_.vocab);
   if (!token_ids || n_tokens <= 0) {
     suppress_active_ = false;
+    h_suppress_.clear();
     cuda_ok(cudaMemsetAsync(d_suppress_, 0, V, stream_), "clear suppress");
     cuda_ok(cudaStreamSynchronize(stream_), "sync suppress clear");
     return;
@@ -1319,6 +1328,7 @@ void EngineInk2::set_suppress(const int32_t* token_ids, int n_tokens) {
     if (id < 0 || id >= cfg_.vocab) throw std::runtime_error("suppress token ID out of range");
     bits[size_t(id)] = 1;
   }
+  h_suppress_ = bits;
   cuda_ok(cudaMemcpyAsync(d_suppress_, bits.data(), V, cudaMemcpyHostToDevice, stream_), "upload suppress");
   cuda_ok(cudaStreamSynchronize(stream_), "sync suppress");
   suppress_active_ = true;
@@ -1349,6 +1359,9 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
                             static_cast<const __nv_bfloat16*>(embed_norm_.d_ptr), d_x_, T, H, cfg_.rms_eps, stream_);
 
     const float* blocks_vec[6] = {};
+    float* bslot_ptr[6] = {d_blocks_[0], d_blocks_[1], d_blocks_[2], d_blocks_[3], d_blocks_[4], d_blocks_[5]};
+    const float* bank0_ptr = d_blocks_[4];
+    float* cur_x = d_x_;
     int n_blocks = 0;
     bool have_prelude = false;
     bool have_prev = false;
@@ -1369,7 +1382,10 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
 
       if (ip == cfg_.core_start) {
         if (!have_prelude) {
-          cuda_ok(cudaMemcpyAsync(d_x_pre_, d_x_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "copy x_pre");
+          if (cur_x != d_x_pre_) {
+            cuda_ok(cudaMemcpyAsync(d_x_pre_, cur_x, row_bytes, cudaMemcpyDeviceToDevice, stream_), "copy x_pre");
+            cur_x = d_x_pre_;
+          }
           n_prelude_blocks = n_blocks;
           if (n_prelude_blocks > cfg_.core_start / cfg_.block_sz) {
             for (int b = 0; b < n_prelude_blocks; ++b)
@@ -1378,11 +1394,16 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
           }
           have_prelude = true;
         } else {
-          cuda_ok(cudaMemcpyAsync(d_blocks_[4], blocks_vec[n_prelude_blocks + 1], row_bytes,
-                                  cudaMemcpyDeviceToDevice, stream_),
-                  "copy bank0");
-          ink2::launch_rmsnorm(d_x_, nullptr, true, d_blocks_[5], T, H, cfg_.rms_eps, stream_);
-          cuda_ok(cudaMemcpyAsync(d_x_, d_x_pre_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "restore x_pre");
+          const float* prev_mid = blocks_vec[n_prelude_blocks + 1];
+          if (n_prelude_blocks <= cfg_.core_start / cfg_.block_sz && prev_mid == bslot_ptr[2]) {
+            std::swap(bslot_ptr[2], bslot_ptr[4]);
+            bank0_ptr = bslot_ptr[4];
+          } else {
+            cuda_ok(cudaMemcpyAsync(bslot_ptr[4], prev_mid, row_bytes, cudaMemcpyDeviceToDevice, stream_), "copy bank0");
+            bank0_ptr = bslot_ptr[4];
+          }
+          ink2::launch_rmsnorm(cur_x, nullptr, true, bslot_ptr[5], T, H, cfg_.rms_eps, stream_);
+          cur_x = d_x_pre_;
           n_blocks = n_prelude_blocks;
           if (n_prelude_blocks > cfg_.core_start / cfg_.block_sz) {
             for (int b = 0; b < n_prelude_blocks; ++b) {
@@ -1398,7 +1419,7 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
       if (capture_taps && mtp_enabled_) {
         for (int ti = 0; ti < 3; ++ti) {
           if (int(v_idx) == mtp_cfg_.taps[ti]) {
-            cuda_ok(cudaMemcpyAsync(d_tap_[ti], d_x_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "capture tap");
+            cuda_ok(cudaMemcpyAsync(d_tap_[ti], cur_x, row_bytes, cudaMemcpyDeviceToDevice, stream_), "capture tap");
           }
         }
       }
@@ -1409,7 +1430,7 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
       const float* msg_m2 = d_msg_out_ + 2 * size_t(T) * size_t(H);
       const float* msg_mlp = d_msg_out_ + 3 * size_t(T) * size_t(H);
       if (has_msgs) {
-        const float* bank[2] = {d_blocks_[4], d_blocks_[5]};
+        const float* bank[2] = {bank0_ptr, bslot_ptr[5]};
         const float* qv = d_msg_queries_ + size_t(ip - cfg_.core_start) * 4 * size_t(H);
         ink2::launch_attn_res(bank, 2, 0x3u, qv, true, 4, d_msg_out_, T, H, cfg_.rms_eps, ar_scale, stream_);
       }
@@ -1417,11 +1438,11 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
       const float* in_ptrs[3];
       bool fused_attn_norm = false;
       if (ip == 0) {
-        in_ptrs[0] = in_ptrs[1] = in_ptrs[2] = d_x_;
+        in_ptrs[0] = in_ptrs[1] = in_ptrs[2] = cur_x;
       } else {
         const float* st[6];
         for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
-        st[n_blocks] = d_x_;
+        st[n_blocks] = cur_x;
         const Ink2Tensor& aq = attn_queries_[size_t(ip - 1)];
         const int nq = (aq.cols == 1) ? 1 : aq.rows;
         const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
@@ -1552,21 +1573,22 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
       ink2::launch_qkvr_prep(d_q_, d_k_, d_v_, d_r_, L.q_scale.d_ptr, L.rel_scale.d_ptr, L.q_scale.f32, d_kc_[v_idx],
                              d_vc_[v_idx], T, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.d_rel, pos0, kv_cap, L.is_swa,
                              cfg_.qk_clip, cfg_.rel_clip, cfg_.rms_eps, cfg_.log_floor, cfg_.log_alpha, d_pos_ptr,
-                             stream_);
+                             kv_bf16_, stream_);
       ink2::launch_rel_bias(cublas_, d_r_, L.rel_proj.d_ptr, L.rel_proj.f32, d_x_bf16_, d_rb_, T, cfg_.hq,
                             cfg_.d_rel, cfg_.rel_extent, stream_);
 
       if (T == 1) {
         ink2::launch_attn_decode(d_q_, d_kc_[v_idx], d_vc_[v_idx], d_rb_, d_sinks_, d_gate_attn_, d_part_m_, d_part_l_,
                                  d_part_o_, d_att_out_, pos0, kv_cap, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.rel_extent,
-                                 L.is_swa, cfg_.swa, d_pos_ptr, stream_);
+                                 L.is_swa, cfg_.swa, d_pos_ptr, kv_bf16_, stream_);
       } else if (T <= kMtpBlock) {
         ink2::launch_attn_verify(d_q_, d_kc_[v_idx], d_vc_[v_idx], d_rb_, d_sinks_, d_gate_attn_, d_part_m_, d_part_l_,
                                  d_part_o_, d_att_out_, T, pos0, kv_cap, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.rel_extent,
-                                 L.is_swa, cfg_.swa, d_pos_ptr, stream_);
+                                 L.is_swa, cfg_.swa, d_pos_ptr, kv_bf16_, stream_);
       } else {
         ink2::launch_attn_prefill(d_q_, d_kc_[v_idx], d_vc_[v_idx], d_rb_, d_sinks_, d_gate_attn_, d_att_out_, T, pos0,
-                                  kv_cap, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.rel_extent, L.is_swa, cfg_.swa, stream_);
+                                  kv_cap, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.rel_extent, L.is_swa, cfg_.swa,
+                                  kv_bf16_, stream_);
       }
 
       mm(L.wo_ud, d_att_out_, d_a_out_);
@@ -1575,11 +1597,11 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
         ink2::launch_sconv_static(d_a_out_, L.attn_sconv.d_ptr, L.attn_sconv.f32, conv_a, d_a_out_, T, H,
                                   sconv_static_scale, stream_, nullptr, d_sconv_tmp_, save_snaps, snap_a, snap_stride);
         const int bslot = ip / cfg_.block_sz;
-        ink2::launch_rmsnorm(d_x_, nullptr, true, d_blocks_[bslot], T, H, cfg_.rms_eps, stream_);
-        blocks_vec[size_t(n_blocks++)] = d_blocks_[bslot];
+        ink2::launch_rmsnorm(cur_x, nullptr, true, bslot_ptr[bslot], T, H, cfg_.rms_eps, stream_);
+        blocks_vec[size_t(n_blocks++)] = bslot_ptr[bslot];
       } else {
         ink2::launch_sconv_static(d_a_out_, L.attn_sconv.d_ptr, L.attn_sconv.f32, conv_a, d_ffn_inp_, T, H,
-                                  sconv_static_scale, stream_, d_x_, nullptr, save_snaps, snap_a, snap_stride);
+                                  sconv_static_scale, stream_, cur_x, nullptr, save_snaps, snap_a, snap_stride);
         ffn_ptr = d_ffn_inp_;
       }
 
@@ -1610,21 +1632,39 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
       }
 
       mm(L.router_w, d_x_mlp_, d_rlog_);
-      ink2::launch_moe_route(d_rlog_, L.router_bias.d_ptr, L.router_bias.f32, d_eid_, d_ew_, T, cfg_.n_experts,
-                             cfg_.top_k, cfg_.route_scale, stream_);
       const ink2::MoeGroupBufs gbuf{d_moe_pair_idx_, d_moe_tile_exp_, d_moe_tile_m0_, d_moe_tile_cnt_, d_moe_num_tiles_};
+      const bool small_grouped = (T >= 2 && T <= 12 && H == 2304 && cfg_.moe_I == 1152 && cfg_.top_k == 8 && cfg_.n_experts == 128);
+      if (small_grouped) {
+        ink2::launch_moe_route_bucket_small(d_rlog_, L.router_bias.d_ptr, L.router_bias.f32, d_eid_, d_ew_,
+                                            &gbuf, T, cfg_.n_experts, cfg_.top_k, cfg_.route_scale, stream_);
+      } else {
+        ink2::launch_moe_route(d_rlog_, L.router_bias.d_ptr, L.router_bias.f32, d_eid_, d_ew_, T, cfg_.n_experts,
+                               cfg_.top_k, cfg_.route_scale, stream_);
+      }
+      const bool fuse_mlp_sconv = (T <= 32 && H == 2304 && cfg_.moe_I == 1152 && cfg_.top_k == 8);
       if (!L.is_mxfp8) {
         ink2::launch_moe_nvfp4(d_x_mlp_, d_eid_, d_ew_, L.w13, L.w13_sc, L.w13_outer, L.w2, L.w2_sc, L.w2_outer,
                                d_moe_act_, d_moe_pair_out_, d_moe_out_, T, H, cfg_.moe_I, cfg_.top_k,
-                               &gbuf, cfg_.n_experts, stream_);
+                               &gbuf, cfg_.n_experts, stream_, !fuse_mlp_sconv, small_grouped);
       } else {
         ink2::launch_moe_mxfp8(d_x_mlp_, d_eid_, d_ew_, L.w13, L.w13_sc, L.w2, L.w2_sc,
                                d_moe_act_, d_moe_pair_out_, d_moe_out_, T, H, cfg_.moe_I, cfg_.top_k,
-                               &gbuf, cfg_.n_experts, stream_);
+                               &gbuf, cfg_.n_experts, stream_, !fuse_mlp_sconv, small_grouped);
       }
 
-      ink2::launch_sconv_static(d_moe_out_, L.mlp_sconv.d_ptr, L.mlp_sconv.f32, conv_m, d_x_, T, H,
-                                sconv_static_scale, stream_, ffn_ptr, nullptr, save_snaps, snap_m, snap_stride);
+      float* next_x = (!have_prelude && int(v_idx) + 1 < int(cfg_.schedule.size()) &&
+                       cfg_.schedule[v_idx + 1] == cfg_.core_start)
+                          ? d_x_pre_
+                          : d_x_;
+      if (fuse_mlp_sconv) {
+        ink2::launch_moe_reduce8_sconv_static(d_moe_pair_out_, L.mlp_sconv.d_ptr, L.mlp_sconv.f32, conv_m, next_x,
+                                              T, H, cfg_.top_k, sconv_static_scale, ffn_ptr,
+                                              save_snaps, snap_m, snap_stride, stream_);
+      } else {
+        ink2::launch_sconv_static(d_moe_out_, L.mlp_sconv.d_ptr, L.mlp_sconv.f32, conv_m, next_x, T, H,
+                                  sconv_static_scale, stream_, ffn_ptr, nullptr, save_snaps, snap_m, snap_stride);
+      }
+      cur_x = next_x;
     }
 
     if (!need_logits && !need_all_logits && !(capture_taps && mtp_enabled_)) return;
@@ -1632,7 +1672,7 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
     {
       const float* st[6];
       for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
-      st[n_blocks] = d_x_;
+      st[n_blocks] = cur_x;
       const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
       ink2::launch_attn_res(st, n_blocks + 1, st_mask, output_query_.d_ptr, output_query_.f32, 1, d_h_norm_, T, H,
                             cfg_.rms_eps, ar_scale, stream_, final_norm_.d_ptr, final_norm_.f32);
@@ -1704,6 +1744,9 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
                           static_cast<const __nv_bfloat16*>(embed_norm_.d_ptr), d_x_, M, H, cfg_.rms_eps, stream_);
 
   const float* blocks_vec[6] = {};
+  float* bslot_ptr[6] = {d_blocks_[0], d_blocks_[1], d_blocks_[2], d_blocks_[3], d_blocks_[4], d_blocks_[5]};
+  const float* bank0_ptr = d_blocks_[4];
+  float* cur_x = d_x_;
   int n_blocks = 0;
   bool have_prelude = false;
   bool have_prev = false;
@@ -1723,7 +1766,10 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
 
     if (ip == cfg_.core_start) {
       if (!have_prelude) {
-        cuda_ok(cudaMemcpyAsync(d_x_pre_, d_x_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "copy tree x_pre");
+        if (cur_x != d_x_pre_) {
+          cuda_ok(cudaMemcpyAsync(d_x_pre_, cur_x, row_bytes, cudaMemcpyDeviceToDevice, stream_), "copy tree x_pre");
+          cur_x = d_x_pre_;
+        }
         n_prelude_blocks = n_blocks;
         if (n_prelude_blocks > cfg_.core_start / cfg_.block_sz) {
           for (int b = 0; b < n_prelude_blocks; ++b)
@@ -1732,11 +1778,16 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
         }
         have_prelude = true;
       } else {
-        cuda_ok(cudaMemcpyAsync(d_blocks_[4], blocks_vec[n_prelude_blocks + 1], row_bytes,
-                                cudaMemcpyDeviceToDevice, stream_),
-                "copy tree bank0");
-        ink2::launch_rmsnorm(d_x_, nullptr, true, d_blocks_[5], M, H, cfg_.rms_eps, stream_);
-        cuda_ok(cudaMemcpyAsync(d_x_, d_x_pre_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "restore tree x_pre");
+        const float* prev_mid = blocks_vec[n_prelude_blocks + 1];
+        if (n_prelude_blocks <= cfg_.core_start / cfg_.block_sz && prev_mid == bslot_ptr[2]) {
+          std::swap(bslot_ptr[2], bslot_ptr[4]);
+          bank0_ptr = bslot_ptr[4];
+        } else {
+          cuda_ok(cudaMemcpyAsync(bslot_ptr[4], prev_mid, row_bytes, cudaMemcpyDeviceToDevice, stream_), "copy tree bank0");
+          bank0_ptr = bslot_ptr[4];
+        }
+        ink2::launch_rmsnorm(cur_x, nullptr, true, bslot_ptr[5], M, H, cfg_.rms_eps, stream_);
+        cur_x = d_x_pre_;
         n_blocks = n_prelude_blocks;
         if (n_prelude_blocks > cfg_.core_start / cfg_.block_sz) {
           for (int b = 0; b < n_prelude_blocks; ++b) {
@@ -1752,7 +1803,7 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
     if (mtp_enabled_) {
       for (int ti = 0; ti < 3; ++ti) {
         if (int(v_idx) == mtp_cfg_.taps[ti]) {
-          cuda_ok(cudaMemcpyAsync(d_tap_[ti], d_x_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "capture tree tap");
+          cuda_ok(cudaMemcpyAsync(d_tap_[ti], cur_x, row_bytes, cudaMemcpyDeviceToDevice, stream_), "capture tree tap");
         }
       }
     }
@@ -1763,7 +1814,7 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
     const float* msg_m2 = d_msg_out_ + 2 * size_t(M) * size_t(H);
     const float* msg_mlp = d_msg_out_ + 3 * size_t(M) * size_t(H);
     if (has_msgs) {
-      const float* bank[2] = {d_blocks_[4], d_blocks_[5]};
+      const float* bank[2] = {bank0_ptr, bslot_ptr[5]};
       const float* qv = d_msg_queries_ + size_t(ip - cfg_.core_start) * 4 * size_t(H);
       ink2::launch_attn_res(bank, 2, 0x3u, qv, true, 4, d_msg_out_, M, H, cfg_.rms_eps, ar_scale, stream_);
     }
@@ -1771,11 +1822,11 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
     const float* in_ptrs[3];
     bool fused_attn_norm = false;
     if (ip == 0) {
-      in_ptrs[0] = in_ptrs[1] = in_ptrs[2] = d_x_;
+      in_ptrs[0] = in_ptrs[1] = in_ptrs[2] = cur_x;
     } else {
       const float* st[6];
       for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
-      st[n_blocks] = d_x_;
+      st[n_blocks] = cur_x;
       const Ink2Tensor& aq = attn_queries_[size_t(ip - 1)];
       const int nq = (aq.cols == 1) ? 1 : aq.rows;
       const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
@@ -1892,7 +1943,7 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
     ink2::launch_attn_tree(d_q_, d_kc_[v_idx], d_vc_[v_idx], stage_k_v, stage_v_v, d_rb_, d_sinks_, d_gate_attn_,
                            d_part_m_, d_part_l_, d_part_o_, d_att_out_, M, pos0, d_pos_ptr, d_tree_depth_,
                            d_tree_anc_mask_, kv_cap, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.rel_extent,
-                           L.is_swa, cfg_.swa, stream_);
+                           L.is_swa, cfg_.swa, kv_bf16_, stream_);
 
     mm(L.wo_ud, d_att_out_, d_a_out_);
     const float* ffn_ptr = d_a_out_;
@@ -1901,12 +1952,12 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
                                      stage_v_sc, stage_stride, 2 * KVD, d_tree_p1_, d_tree_p2_, d_tree_p3_,
                                      M, H, sconv_static_scale, nullptr, stream_);
       const int bslot = ip / cfg_.block_sz;
-      ink2::launch_rmsnorm(d_x_, nullptr, true, d_blocks_[bslot], M, H, cfg_.rms_eps, stream_);
-      blocks_vec[size_t(n_blocks++)] = d_blocks_[bslot];
+      ink2::launch_rmsnorm(cur_x, nullptr, true, bslot_ptr[bslot], M, H, cfg_.rms_eps, stream_);
+      blocks_vec[size_t(n_blocks++)] = bslot_ptr[bslot];
     } else {
       ink2::launch_sconv_static_tree(d_a_out_, L.attn_sconv.d_ptr, L.attn_sconv.f32, conv_a, d_ffn_inp_,
                                      stage_v_sc, stage_stride, 2 * KVD, d_tree_p1_, d_tree_p2_, d_tree_p3_,
-                                     M, H, sconv_static_scale, d_x_, stream_);
+                                     M, H, sconv_static_scale, cur_x, stream_);
       ffn_ptr = d_ffn_inp_;
     }
 
@@ -1934,28 +1985,46 @@ void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) 
     }
 
     mm(L.router_w, d_x_mlp_, d_rlog_);
-    ink2::launch_moe_route(d_rlog_, L.router_bias.d_ptr, L.router_bias.f32, d_eid_, d_ew_, M, cfg_.n_experts,
-                           cfg_.top_k, cfg_.route_scale, stream_);
     const ink2::MoeGroupBufs gbuf{d_moe_pair_idx_, d_moe_tile_exp_, d_moe_tile_m0_, d_moe_tile_cnt_, d_moe_num_tiles_};
+    const bool small_grouped = (M >= 2 && M <= 12 && H == 2304 && cfg_.moe_I == 1152 && cfg_.top_k == 8 && cfg_.n_experts == 128);
+    if (small_grouped) {
+      ink2::launch_moe_route_bucket_small(d_rlog_, L.router_bias.d_ptr, L.router_bias.f32, d_eid_, d_ew_,
+                                          &gbuf, M, cfg_.n_experts, cfg_.top_k, cfg_.route_scale, stream_);
+    } else {
+      ink2::launch_moe_route(d_rlog_, L.router_bias.d_ptr, L.router_bias.f32, d_eid_, d_ew_, M, cfg_.n_experts,
+                             cfg_.top_k, cfg_.route_scale, stream_);
+    }
+    const bool fuse_mlp_sconv = (M <= 32 && H == 2304 && cfg_.moe_I == 1152 && cfg_.top_k == 8);
     if (!L.is_mxfp8) {
       ink2::launch_moe_nvfp4(d_x_mlp_, d_eid_, d_ew_, L.w13, L.w13_sc, L.w13_outer, L.w2, L.w2_sc, L.w2_outer,
                              d_moe_act_, d_moe_pair_out_, d_moe_out_, M, H, cfg_.moe_I, cfg_.top_k,
-                             &gbuf, cfg_.n_experts, stream_);
+                             &gbuf, cfg_.n_experts, stream_, !fuse_mlp_sconv, small_grouped);
     } else {
       ink2::launch_moe_mxfp8(d_x_mlp_, d_eid_, d_ew_, L.w13, L.w13_sc, L.w2, L.w2_sc,
                              d_moe_act_, d_moe_pair_out_, d_moe_out_, M, H, cfg_.moe_I, cfg_.top_k,
-                             &gbuf, cfg_.n_experts, stream_);
+                             &gbuf, cfg_.n_experts, stream_, !fuse_mlp_sconv, small_grouped);
     }
 
-    ink2::launch_sconv_static_tree(d_moe_out_, L.mlp_sconv.d_ptr, L.mlp_sconv.f32, conv_m, d_x_,
-                                   stage_v_sc, stage_stride, 2 * KVD + H, d_tree_p1_, d_tree_p2_, d_tree_p3_,
-                                   M, H, sconv_static_scale, ffn_ptr, stream_);
+    float* next_x = (!have_prelude && int(v_idx) + 1 < int(cfg_.schedule.size()) &&
+                     cfg_.schedule[v_idx + 1] == cfg_.core_start)
+                        ? d_x_pre_
+                        : d_x_;
+    if (fuse_mlp_sconv) {
+      ink2::launch_moe_reduce8_sconv_static_tree(d_moe_pair_out_, L.mlp_sconv.d_ptr, L.mlp_sconv.f32, conv_m, next_x,
+                                                 stage_v_sc, stage_stride, 2 * KVD + H, d_tree_p1_, d_tree_p2_,
+                                                 d_tree_p3_, M, H, cfg_.top_k, sconv_static_scale, ffn_ptr, stream_);
+    } else {
+      ink2::launch_sconv_static_tree(d_moe_out_, L.mlp_sconv.d_ptr, L.mlp_sconv.f32, conv_m, next_x,
+                                     stage_v_sc, stage_stride, 2 * KVD + H, d_tree_p1_, d_tree_p2_, d_tree_p3_,
+                                     M, H, sconv_static_scale, ffn_ptr, stream_);
+    }
+    cur_x = next_x;
   }
 
   {
     const float* st[6];
     for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
-    st[n_blocks] = d_x_;
+    st[n_blocks] = cur_x;
     const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
     ink2::launch_attn_res(st, n_blocks + 1, st_mask, output_query_.d_ptr, output_query_.f32, 1, d_h_norm_, M, H,
                           cfg_.rms_eps, ar_scale, stream_, final_norm_.d_ptr, final_norm_.f32);
@@ -1997,10 +2066,10 @@ void EngineInk2::draft_beam_tree(int32_t anchor_tok, int pos0, int max_nodes, in
                                      static_cast<const __nv_bfloat16*>(L.k_norm.d_ptr),
                                      d_mtp_kc_[i], d_mtp_vc_[i], B, mtp_cfg_.hq, mtp_cfg_.hkv, mtp_cfg_.head_dim,
                                      0, d_step_pos_, kv_cap, L.is_local, true, mtp_cfg_.rms_eps, mtp_cfg_.rope_theta,
-                                     stream_);
+                                     kv_bf16_, stream_);
       ink2::launch_mtp_attn(d_mtp_blk_q_, d_mtp_kc_[i], d_mtp_vc_[i], d_mtp_blk_k_, d_mtp_blk_v_, d_mtp_blk_att_,
                             B, 0, d_step_pos_, kv_cap, mtp_cfg_.hq, mtp_cfg_.hkv, mtp_cfg_.head_dim,
-                            L.is_local, mtp_cfg_.swa, stream_);
+                            L.is_local, mtp_cfg_.swa, kv_bf16_, stream_);
       ink2::launch_linear(cublas_, d_mtp_blk_att_, L.o_proj.d_ptr, L.o_proj.f32, d_x_bf16_, d_mtp_blk_out_,
                           B, H, QD, false, stream_);
       ink2::launch_mtp_res_add_bf16(d_mtp_blk_x_, d_mtp_blk_out_, d_mtp_blk_res_, B * H, stream_);
@@ -2076,7 +2145,7 @@ void EngineInk2::draft_beam_tree(int32_t anchor_tok, int pos0, int max_nodes, in
   });
 
   const int max_usable = std::min(max_nodes, 1 + n_cand);
-  static constexpr int kBuckets[kNumTreeBuckets] = {3, 4, 5, 6, 8, 10, 12};
+  static constexpr int kBuckets[kNumTreeBuckets] = {2, 3, 4, 5, 6, 8, 10, 12};
   double pref_p[kBeamPoolCap + 1];
   pref_p[0] = 1.0;
   for (int i = 0; i < n_cand; ++i) {
@@ -2095,7 +2164,7 @@ void EngineInk2::draft_beam_tree(int32_t anchor_tok, int pos0, int max_nodes, in
       best_m = mb;
     }
   }
-  if (best_m < 3) {
+  if (best_m < 2) {
     out_tree = TreeSpec{};
     return;
   }
@@ -2119,7 +2188,7 @@ void EngineInk2::draft_beam_tree(int32_t anchor_tok, int pos0, int max_nodes, in
     for (int mb : kBuckets) {
       if (mb <= n_kept) snapped = mb;
     }
-    if (snapped < 3) {
+    if (snapped < 2) {
       out_tree = TreeSpec{};
       return;
     }
@@ -2188,7 +2257,7 @@ void EngineInk2::commit_mtp_context(int pos0, int m, const int32_t* d_pos_ptr, b
                                    static_cast<const __nv_bfloat16*>(L.k_norm_ctx.d_ptr),
                                    d_mtp_kc_[i], d_mtp_vc_[i], m, mtp_cfg_.hq, mtp_cfg_.hkv, mtp_cfg_.head_dim,
                                    pos0, d_pos_ptr, kv_cap, L.is_local, false, mtp_cfg_.rms_eps, mtp_cfg_.rope_theta,
-                                   stream_);
+                                   kv_bf16_, stream_);
   }
   ink2::launch_mtp_fuse_norm(d_tap_[0], d_tap_[1], d_tap_[2], d_h_norm_, m - 1,
                              mtp_fuse_[3][0], mtp_fuse_[3][1], mtp_fuse_[3][2], mtp_fuse_[3][3],
@@ -2218,10 +2287,10 @@ void EngineInk2::mtp_draft_step(int pos0, int Kd, const int32_t* d_pos_ptr, bool
                                    static_cast<const __nv_bfloat16*>(L.k_norm.d_ptr),
                                    d_mtp_kc_[i], d_mtp_vc_[i], B, mtp_cfg_.hq, mtp_cfg_.hkv, mtp_cfg_.head_dim,
                                    pos0, d_pos_ptr, kv_cap, L.is_local, true, mtp_cfg_.rms_eps, mtp_cfg_.rope_theta,
-                                   stream_);
+                                   kv_bf16_, stream_);
     ink2::launch_mtp_attn(d_mtp_blk_q_, d_mtp_kc_[i], d_mtp_vc_[i], d_mtp_blk_k_, d_mtp_blk_v_, d_mtp_blk_att_,
                           B, pos0, d_pos_ptr, kv_cap, mtp_cfg_.hq, mtp_cfg_.hkv, mtp_cfg_.head_dim,
-                          L.is_local, mtp_cfg_.swa, stream_);
+                          L.is_local, mtp_cfg_.swa, kv_bf16_, stream_);
     ink2::launch_linear(cublas_, d_mtp_blk_att_, L.o_proj.d_ptr, L.o_proj.f32, d_x_bf16_, d_mtp_blk_out_,
                         B, H, QD, false, stream_);
     ink2::launch_mtp_res_add_bf16(d_mtp_blk_x_, d_mtp_blk_out_, d_mtp_blk_res_, B * H, stream_);
@@ -2505,13 +2574,65 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
       pend_m = 0;
     }
 
-    if (use_tree_ && greedy && tree_max_ >= 3 && room >= 2 && rem_gen >= 3) {
-      TreeSpec tr;
+    if (use_tree_ && greedy && tree_max_ >= 2 && room >= 1 && rem_gen >= 2) {
+      static constexpr int kBuckets[kNumTreeBuckets] = {2, 3, 4, 5, 6, 8, 10, 12};
+      TreeSpec tr{};
       const int depth_cap = std::min(room, rem_gen - 1);
       const int max_nodes = std::min(tree_max_, room + 1);
-      draft_beam_tree(cur, pos_, max_nodes, depth_cap, tr);
-      if (tr.M >= 3) {
-        static constexpr int kBuckets[kNumTreeBuckets] = {3, 4, 5, 6, 8, 10, 12};
+      if (use_suffix_draft_ && !is_eos(cur) && live_tokens_.size() >= 8) {
+        const int L = int(live_tokens_.size());
+        int best_p = -1;
+        int best_len = 3;
+        for (int p = L - 2; p >= 3; --p) {
+          if (live_tokens_[size_t(p)] != cur) continue;
+          int mlen = 1;
+          const int kmax = std::min(16, p);
+          for (int k = 1; k <= kmax; ++k) {
+            if (live_tokens_[size_t(p - k)] != live_tokens_[size_t(L - k)]) break;
+            ++mlen;
+          }
+          if (mlen > best_len) {
+            best_len = mlen;
+            best_p = p;
+            if (best_len >= 17 && (L - 1 - p) >= kMaxTree - 1) break;
+          }
+        }
+        if (best_p >= 0) {
+          const int per = L - best_p;
+          const int suf_max = (best_len >= 6) ? kMaxTree : tree_max_;
+          const int chain_cap = std::min({suf_max, kMaxTree, room + 1, depth_cap + 1});
+          const int max_j = (best_len >= per) ? (chain_cap - 1) : std::min(chain_cap - 1, per - 1);
+          int32_t chain[kMaxTree];
+          chain[0] = cur;
+          int raw_m = 1;
+          for (int j = 1; j <= max_j; ++j) {
+            const int off = (best_len >= per) ? (j % per) : j;
+            const int32_t nt = (off == 0) ? cur : live_tokens_[size_t(best_p + off)];
+            if (nt < 0 || nt >= cfg_.vocab || is_eos(nt)) break;
+            if (suppress_active_ && size_t(nt) < h_suppress_.size() && h_suppress_[size_t(nt)]) break;
+            chain[raw_m++] = nt;
+          }
+          int snap_m = 0;
+          for (int mb : kBuckets) {
+            if (mb <= raw_m) snap_m = mb;
+          }
+          if (snap_m >= 2) {
+            tr.M = snap_m;
+            tr.max_depth = snap_m - 1;
+            for (int nid = 0; nid < snap_m; ++nid) {
+              tr.tok[nid] = chain[nid];
+              const int8_t par = int8_t(nid - 1);
+              tr.p1[nid] = par;
+              tr.p2[nid] = (nid >= 2) ? int8_t(nid - 2) : int8_t(-1);
+              tr.p3[nid] = (nid >= 3) ? int8_t(nid - 3) : int8_t(-1);
+              tr.depth[nid] = uint8_t(nid);
+              tr.anc_mask[nid] = (nid == 0) ? 1u : (tr.anc_mask[nid - 1] | (1u << nid));
+            }
+          }
+        }
+      }
+      if (tr.M < 2) draft_beam_tree(cur, pos_, max_nodes, depth_cap, tr);
+      if (tr.M >= 2) {
         int bidx = -1;
         for (int b = 0; b < kNumTreeBuckets; ++b) {
           if (kBuckets[b] == tr.M) {
@@ -2609,7 +2730,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
                                          int(cfg_.schedule.size()), kMaxTree, KVD_m, cfg_.hidden, stream_);
           ink2::launch_commit_kv_all48(d_kc_ptrs_, d_vc_ptrs_, d_kv_cap_, d_kv_is_swa_, d_stage_k_, d_stage_v_,
                                        d_acc_path_, step_p0, commit_len, int(cfg_.schedule.size()), kMaxTree,
-                                       cfg_.hkv, cfg_.head_dim, stream_);
+                                       cfg_.hkv, cfg_.head_dim, kv_bf16_, stream_);
           ink2::launch_compact_taps(d_tap_[0], d_tap_[1], d_tap_[2], d_h_norm_, d_tap_scratch_, d_acc_path_,
                                     commit_len, cfg_.hidden, stream_);
 

@@ -133,7 +133,7 @@ class EngineInk2 {
   static constexpr int kPrefillChunk = 1024;
   static constexpr int kMtpBlock = 8;
   static constexpr int kMaxTree = 12;
-  static constexpr int kNumTreeBuckets = 7;  // {3, 4, 5, 6, 8, 10, 12}
+  static constexpr int kNumTreeBuckets = 8;  // {2, 3, 4, 5, 6, 8, 10, 12}
   static constexpr int kDsparkKCand = 512;
   static constexpr int kBeamW = 4;
   static constexpr int kBeamPoolCap = 64;
@@ -231,8 +231,10 @@ class EngineInk2 {
   float* d_msg_queries_ = nullptr;
   std::vector<Ink2Layer> layers_;
 
-  // KV caches (FP32 for exact parity) & short-conv history across 48 visits
-  std::vector<float*> d_kc_, d_vc_;
+  // KV caches (FP32 default for exact parity & short-ctx speed; BF16 opt-in via YSKN_INK2_KV=bf16) & short-conv history across 48 visits
+  bool kv_bf16_ = false;
+  bool use_suffix_draft_ = true;
+  std::vector<void*> d_kc_, d_vc_;
   float* d_conv_base_ = nullptr;
   std::vector<float*> d_conv_;
   float* d_verify_conv_ = nullptr;
@@ -268,6 +270,7 @@ class EngineInk2 {
 
   // Token suppression bitmask (byte-per-token on GPU, 200058 bytes) & pinned host staging for sampling/argmax
   uint8_t* d_suppress_ = nullptr;
+  std::vector<uint8_t> h_suppress_;
   bool suppress_active_ = false;
   float* h_logits_ = nullptr;
   float* h_verify_logits_ = nullptr;
@@ -292,7 +295,7 @@ class EngineInk2 {
   __half* d_mtp_fold_s_ = nullptr;
   float* d_mtp_fold_b_ = nullptr;
   std::vector<Ink2MtpLayer> mtp_layers_;
-  float *d_mtp_kc_[3] = {}, *d_mtp_vc_[3] = {};
+  void *d_mtp_kc_[3] = {}, *d_mtp_vc_[3] = {};
   float *d_mtp_rec_feat_ = nullptr, *d_mtp_ctx_h_ = nullptr, *d_mtp_ctx_k_ = nullptr, *d_mtp_ctx_v_ = nullptr;
   float *d_mtp_blk_x_ = nullptr, *d_mtp_blk_res_ = nullptr, *d_mtp_blk_norm_ = nullptr;
   float *d_mtp_blk_q_ = nullptr, *d_mtp_blk_k_ = nullptr, *d_mtp_blk_v_ = nullptr, *d_mtp_blk_att_ = nullptr;
@@ -329,7 +332,7 @@ class EngineInk2 {
   uint8_t* d_tree_depth_ = nullptr;
   uint32_t* d_tree_anc_mask_ = nullptr;
   int32_t* d_acc_path_ = nullptr;
-  float **d_kc_ptrs_ = nullptr, **d_vc_ptrs_ = nullptr;
+  void **d_kc_ptrs_ = nullptr, **d_vc_ptrs_ = nullptr;
   int32_t* d_kv_cap_ = nullptr;
   uint8_t* d_kv_is_swa_ = nullptr;
 
