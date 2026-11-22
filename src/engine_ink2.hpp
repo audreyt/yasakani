@@ -132,6 +132,12 @@ class EngineInk2 {
  public:
   static constexpr int kPrefillChunk = 1024;
   static constexpr int kMtpBlock = 8;
+  static constexpr int kMaxTree = 12;
+  static constexpr int kNumTreeBuckets = 7;  // {3, 4, 5, 6, 8, 10, 12}
+  static constexpr int kDsparkKCand = 512;
+  static constexpr int kBeamW = 4;
+  static constexpr int kBeamPoolCap = 64;
+  static constexpr int kScreenMaxCand = 8192;
 
   EngineInk2(const std::string& path, int max_ctx, int flags);
   ~EngineInk2();
@@ -156,9 +162,22 @@ class EngineInk2 {
                 const std::atomic<int>* cancel, int32_t* out_ids, Ink2GenStats& st);
 
  private:
+  struct TreeSpec {
+    int M = 0;
+    int max_depth = 0;
+    int32_t tok[kMaxTree] = {};
+    int8_t p1[kMaxTree] = {};
+    int8_t p2[kMaxTree] = {};
+    int8_t p3[kMaxTree] = {};
+    uint8_t depth[kMaxTree] = {};
+    uint32_t anc_mask[kMaxTree] = {};
+  };
+
   void forward_tokens(const int32_t* ids, int T, int pos0, bool need_logits,
                       bool capture_taps = false, bool save_snaps = false, bool need_all_logits = false,
-                      const int32_t* d_pos_ptr = nullptr);
+                      const int32_t* d_pos_ptr = nullptr, bool greedy_argmax_only = false);
+  void forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr);
+  void draft_beam_tree(int32_t anchor_tok, int pos0, int max_nodes, int room, TreeSpec& out_tree);
   void commit_mtp_context(int pos0, int m, const int32_t* d_pos_ptr, bool restore_conv);
   void mtp_draft_step(int pos0, int Kd, const int32_t* d_pos_ptr, bool greedy, int64_t step_pos);
   void mtp_verify_step(int pos0, int R, const int32_t* d_pos_ptr, bool greedy);
@@ -198,6 +217,15 @@ class EngineInk2 {
   __half* d_unembed_q8_sc_ = nullptr;
   int8_t* d_draft_u_q8_ = nullptr;
   __half* d_draft_u_sc_ = nullptr;
+  bool use_screen_head_ = false;
+  int8_t* d_screen_q8_ = nullptr;
+  float* d_screen_sc_ = nullptr;
+  float* d_screen_eps_ = nullptr;
+  float* d_screen_hnorm_ = nullptr;
+  int* d_screen_max_lb_ = nullptr;
+  float* d_screen_dot_hat_ = nullptr;
+  int32_t* d_screen_cand_ids_ = nullptr;
+  int32_t* d_screen_cand_cnt_ = nullptr;
   std::vector<Ink2Tensor> attn_queries_, mlp_queries_;
   Ink2Tensor output_query_;
   float* d_msg_queries_ = nullptr;
@@ -246,14 +274,19 @@ class EngineInk2 {
   int32_t* h_tok_ = nullptr;
   int32_t* d_verify_samples_ = nullptr;
   int32_t* h_pair_toks_ = nullptr;
+  int32_t* h_tree_next_ = nullptr;
 
-  // DSpark MTP drafter
+  // DSpark MTP drafter & W=4 Bayes-Optimal Beam Tree
   bool mtp_enabled_ = false;
   bool mtp_q8_ = true;
+  bool use_tree_ = false;
+  float moe_ratio_ = 12.0f;
+  int tree_max_ = kMaxTree;
   Ink2MtpConfig mtp_cfg_;
   float mtp_fuse_[4][4] = {};
   Ink2Tensor mtp_mask_embed_, mtp_norm_, mtp_rec_norm_;
-  Ink2Tensor mtp_markov_w1_, mtp_rnn_proj_w_, mtp_rnn_proj_b_;
+  Ink2Tensor mtp_markov_w1_, mtp_rnn_proj_w_, mtp_rnn_proj_b_, mtp_hidden_out_w_;
+  float* d_mtp_ho_b_ = nullptr;
   const __nv_bfloat16* d_mtp_fold_w_ = nullptr;
   int8_t* d_mtp_fold_q_ = nullptr;
   __half* d_mtp_fold_s_ = nullptr;
@@ -268,14 +301,54 @@ class EngineInk2 {
   float *d_mtp_logits_ = nullptr;
   float* h_mtp_draft_logits_ = nullptr;
 
-  // CUDA Graphs: T=1 plain decode ([sup]), combined MTP draft+verify ([K-1][sup]), pipelined commit ([m-1])
+  // Beam-tree draft + staging + all-48-visit commit buffers
+  int8_t* d_beam_h_q8_ = nullptr;
+  float* d_beam_h_sc_ = nullptr;
+  int32_t* d_beam_top_tmp_ids_ = nullptr;
+  float* d_beam_top_tmp_vals_ = nullptr;
+  int32_t* d_beam_cand_ids_ = nullptr;
+  float* d_beam_cand_base_ = nullptr;
+  float *d_beam_state_ = nullptr, *d_beam_state_next_ = nullptr;
+  int32_t *d_beam_prev_tok_ = nullptr, *d_beam_node_ = nullptr;
+  float* d_beam_logp_ = nullptr;
+  float *d_beam_joint_ = nullptr, *d_beam_proj_ = nullptr, *d_beam_lat_ = nullptr;
+  float *d_beam_corr_ = nullptr, *d_beam_cand_scores_ = nullptr;
+  int32_t *d_pool_tok_ = nullptr, *d_pool_cnt_ = nullptr;
+  int8_t* d_pool_parent_ = nullptr;
+  uint8_t* d_pool_depth_ = nullptr;
+  float* d_pool_logp_ = nullptr;
+  int32_t* h_pool_tok_ = nullptr;
+  int8_t* h_pool_parent_ = nullptr;
+  uint8_t* h_pool_depth_ = nullptr;
+  float* h_pool_logp_ = nullptr;
+  int32_t* h_pool_cnt_ = nullptr;
+
+  float *d_stage_k_ = nullptr, *d_stage_v_ = nullptr, *d_stage_sconv_ = nullptr;
+  float* d_tap_scratch_ = nullptr;
+  int8_t *d_tree_p1_ = nullptr, *d_tree_p2_ = nullptr, *d_tree_p3_ = nullptr;
+  uint8_t* d_tree_depth_ = nullptr;
+  uint32_t* d_tree_anc_mask_ = nullptr;
+  int32_t* d_acc_path_ = nullptr;
+  float **d_kc_ptrs_ = nullptr, **d_vc_ptrs_ = nullptr;
+  int32_t* d_kv_cap_ = nullptr;
+  uint8_t* d_kv_is_swa_ = nullptr;
+
+  // CUDA Graphs:
+  // - T=1 plain decode ([argmax_only][sup])
+  // - linear MTP draft+verify ([K-1][sup])
+  // - pipelined MTP context commit ([restore_conv][m-1])
+  // - W=4 beam tree draft ([sup]) & tree verify ([bucket][sup])
   bool use_graph_ = true;
-  cudaGraph_t decode_graph_[2] = {};
-  cudaGraphExec_t decode_graph_exec_[2] = {};
+  cudaGraph_t decode_graph_[2][2] = {};
+  cudaGraphExec_t decode_graph_exec_[2][2] = {};
   cudaGraph_t dv_graph_[7][2] = {};
   cudaGraphExec_t dv_graph_exec_[7][2] = {};
-  cudaGraph_t commit_graph_[8] = {};
-  cudaGraphExec_t commit_graph_exec_[8] = {};
+  cudaGraph_t commit_graph_[2][8] = {};
+  cudaGraphExec_t commit_graph_exec_[2][8] = {};
+  cudaGraph_t beam_draft_graph_[2] = {};
+  cudaGraphExec_t beam_draft_graph_exec_[2] = {};
+  cudaGraph_t tree_verify_graph_[kNumTreeBuckets][2] = {};
+  cudaGraphExec_t tree_verify_graph_exec_[kNumTreeBuckets][2] = {};
 };
 
 }  // namespace yskn

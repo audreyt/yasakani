@@ -532,6 +532,30 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   if (const char* mq8 = std::getenv("YSKN_INK2_MTP_Q8")) mtp_q8_ = (std::strcmp(mq8, "0") != 0);
   if (mtp_cfg_.markov_rank != 256) mtp_q8_ = false;
 
+  bool screen_want = !use_q8_head_ && (cfg_.hidden == 2304);
+  if (const char* es = std::getenv("YSKN_INK2_SCREEN_HEAD")) {
+    if (std::strcmp(es, "0") == 0) screen_want = false;
+  }
+  use_screen_head_ = screen_want && !use_q8_head_ && (cfg_.hidden == 2304);
+
+  bool tree_want = mtp_enabled_ && use_screen_head_ && !use_q8_head_ && (mtp_cfg_.markov_rank == 256) && (cfg_.hidden == 2304);
+  if (const char* et = std::getenv("YSKN_INK2_TREE")) {
+    if (std::strcmp(et, "0") == 0) tree_want = false;
+  }
+  use_tree_ = tree_want && use_screen_head_ && mtp_enabled_ && !use_q8_head_ && (mtp_cfg_.markov_rank == 256) && (cfg_.hidden == 2304);
+  // Across 48 visits, reading all 128 NVFP4/MXFP8 experts moves ~33 GB vs ~2.5 GB fixed dense+head overhead (~13x byte ratio);
+  // bandwidth-bound low-SM GPUs (e.g. GB10 with 48 SMs) benefit from tighter trees (M<=6) and higher MoE cost weighting.
+  moe_ratio_ = (sm_count_ <= 64) ? 15.0f : 12.0f;
+  tree_max_ = (sm_count_ <= 64) ? 6 : kMaxTree;
+  if (const char* er = std::getenv("YSKN_INK2_MOE_RATIO")) {
+    const float r = std::strtof(er, nullptr);
+    if (std::isfinite(r) && r > 0.0f) moe_ratio_ = r;
+  }
+  if (const char* emx = std::getenv("YSKN_INK2_TREE_MAX")) {
+    const int m = std::atoi(emx);
+    if (m >= 3) tree_max_ = std::min(kMaxTree, m);
+  }
+
   DevGuard tmp_u_bf16;
   const __nv_bfloat16* u_bf16_for_fold = nullptr;
   if (use_q8_head_) {
@@ -555,6 +579,23 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   if (!use_q8_head_) {
     unembed_ = upload_tensor("model.llm.unembed.weight", "BF16", {cfg_.vocab_padded, H});
     u_bf16_for_fold = static_cast<const __nv_bfloat16*>(unembed_.d_ptr);
+    if (use_screen_head_ || use_tree_) {
+      const int V_scr = cfg_.vocab;
+      const int H_scr = cfg_.hidden;
+      d_screen_q8_ = static_cast<int8_t*>(alloc_gpu(size_t(V_scr) * size_t(H_scr)));
+      d_screen_sc_ = static_cast<float*>(alloc_gpu(size_t(V_scr) * sizeof(float)));
+      d_screen_eps_ = static_cast<float*>(alloc_gpu(size_t(V_scr) * sizeof(float)));
+      ink2::launch_build_unembed_screen_bf16(u_bf16_for_fold, d_screen_q8_, d_screen_sc_, d_screen_eps_, V_scr, H_scr,
+                                             stream_);
+      if (use_screen_head_) {
+        d_screen_hnorm_ = static_cast<float*>(alloc_gpu(8 * sizeof(float)));
+        d_screen_max_lb_ = static_cast<int*>(alloc_gpu(8 * sizeof(int)));
+        d_screen_dot_hat_ = static_cast<float*>(alloc_gpu(8 * size_t(V_scr) * sizeof(float)));
+        d_screen_cand_ids_ = static_cast<int32_t*>(alloc_gpu(8 * size_t(kScreenMaxCand) * sizeof(int32_t)));
+        d_screen_cand_cnt_ = static_cast<int32_t*>(alloc_gpu(8 * sizeof(int32_t)));
+      }
+      cuda_ok(cudaStreamSynchronize(stream_), "sync build unembed screen");
+    }
   }
 
   attn_queries_.resize(size_t(cfg_.num_layers - 1));
@@ -768,8 +809,8 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
 
   d_tokens_ = static_cast<int32_t*>(alloc_gpu(T * sizeof(int32_t)));
   d_tok_out_ = static_cast<int32_t*>(alloc_gpu(sizeof(int32_t)));
-  d_blk_v_ = static_cast<float*>(alloc_gpu(size_t(kMtpBlock) * 256 * sizeof(float)));
-  d_blk_i_ = static_cast<int32_t*>(alloc_gpu(size_t(kMtpBlock) * 256 * sizeof(int32_t)));
+  d_blk_v_ = static_cast<float*>(alloc_gpu(size_t(kMaxTree) * 256 * sizeof(float)));
+  d_blk_i_ = static_cast<int32_t*>(alloc_gpu(size_t(kMaxTree) * 256 * sizeof(int32_t)));
   d_x_bf16_ = static_cast<__nv_bfloat16*>(alloc_gpu(T * size_t(cfg_.hq * cfg_.head_dim) * sizeof(__nv_bfloat16)));
 
   d_x_ = static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float)));
@@ -808,10 +849,10 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   d_dyn_ = static_cast<float*>(alloc_gpu(T * 32 * sizeof(float)));
   d_sconv_tmp_ = static_cast<float*>(alloc_gpu(T * std::max<size_t>(size_t(H), 2 * size_t(KVD)) * sizeof(float)));
   d_rb_ = static_cast<float*>(alloc_gpu(T * size_t(cfg_.hq) * size_t(cfg_.rel_extent) * sizeof(float)));
-  d_part_m_ = static_cast<float*>(alloc_gpu(size_t(kMtpBlock) * size_t(cfg_.hq) * kMaxAttnChunks * sizeof(float)));
-  d_part_l_ = static_cast<float*>(alloc_gpu(size_t(kMtpBlock) * size_t(cfg_.hq) * kMaxAttnChunks * sizeof(float)));
+  d_part_m_ = static_cast<float*>(alloc_gpu(size_t(kMaxTree) * size_t(cfg_.hq) * kMaxAttnChunks * sizeof(float)));
+  d_part_l_ = static_cast<float*>(alloc_gpu(size_t(kMaxTree) * size_t(cfg_.hq) * kMaxAttnChunks * sizeof(float)));
   d_part_o_ = static_cast<float*>(
-      alloc_gpu(size_t(kMtpBlock) * size_t(cfg_.hq) * kMaxAttnChunks * size_t(cfg_.head_dim) * sizeof(float)));
+      alloc_gpu(size_t(kMaxTree) * size_t(cfg_.hq) * kMaxAttnChunks * size_t(cfg_.head_dim) * sizeof(float)));
 
   d_h_mlp_ = static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float)));
   d_x_mlp_ = static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float)));
@@ -823,7 +864,7 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   d_moe_pair_out_ = static_cast<float*>(alloc_gpu(P_max * size_t(H) * sizeof(float)));
   d_moe_out_ = static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float)));
   d_moe_pair_idx_ =
-      static_cast<int32_t*>(alloc_gpu(std::max<size_t>(P_max, size_t(kMtpBlock) * size_t(cfg_.top_k) * 3) * sizeof(int32_t)));
+      static_cast<int32_t*>(alloc_gpu(std::max<size_t>(P_max, size_t(kMaxTree) * size_t(cfg_.top_k) * 3) * sizeof(int32_t)));
   const size_t max_tiles = size_t(cfg_.n_experts) + P_max / 16;
   d_moe_tile_exp_ = static_cast<int32_t*>(alloc_gpu(max_tiles * sizeof(int32_t)));
   d_moe_tile_m0_ = static_cast<int32_t*>(alloc_gpu(max_tiles * sizeof(int32_t)));
@@ -833,12 +874,13 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   d_logits_ = static_cast<float*>(alloc_gpu(V * sizeof(float)));
   d_verify_logits_ = static_cast<float*>(alloc_gpu(size_t(kMtpBlock) * V * sizeof(float)));
   d_suppress_ = static_cast<uint8_t*>(alloc_gpu(V));
-  d_verify_samples_ = static_cast<int32_t*>(alloc_gpu(size_t(kMtpBlock) * sizeof(int32_t)));
+  d_verify_samples_ = static_cast<int32_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(int32_t)));
 
   cuda_ok(cudaMallocHost(&h_logits_, V * sizeof(float)), "cudaMallocHost logits");
   cuda_ok(cudaMallocHost(&h_verify_logits_, size_t(kMtpBlock) * V * sizeof(float)), "cudaMallocHost verify_logits");
   cuda_ok(cudaMallocHost(&h_tok_, sizeof(int32_t)), "cudaMallocHost tok");
   cuda_ok(cudaMallocHost(&h_pair_toks_, 2 * size_t(kMtpBlock) * sizeof(int32_t)), "cudaMallocHost pair_toks");
+  cuda_ok(cudaMallocHost(&h_tree_next_, size_t(kMaxTree) * sizeof(int32_t)), "cudaMallocHost tree_next");
   cuda_ok(cudaMemsetAsync(d_suppress_, 0, V, stream_), "clear suppress");
 
   if (mtp_enabled_) {
@@ -984,6 +1026,12 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     expect_tensor(how, "markov_head.hidden_out.weight", "BF16", {MH, MR});
     expect_tensor(hob, "markov_head.hidden_out.bias", "BF16", {MH});
     const std::vector<float> hb_vec = m_f32_vec(hob);
+    if (use_tree_) {
+      mtp_hidden_out_w_ = m_upload("markov_head.hidden_out.weight", "BF16", {MH, MR});
+      d_mtp_ho_b_ = static_cast<float*>(alloc_gpu(hb_vec.size() * sizeof(float)));
+      cuda_ok(cudaMemcpyAsync(d_mtp_ho_b_, hb_vec.data(), hb_vec.size() * sizeof(float), cudaMemcpyHostToDevice, stream_),
+              "upload mtp ho bias");
+    }
     std::vector<uint16_t> wt_bf16(size_t(MR) * size_t(MH));
     {
       std::vector<uint16_t> hw(size_t(MH) * size_t(MR));
@@ -1026,11 +1074,11 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     cuda_ok(cudaStreamSynchronize(stream_), "sync mtp fold");
     mreader.close_all();
 
-    // Draft-only Q8_0 unembed (2x faster draft logits while verify keeps exact HEAD parity)
+    // Draft-only Q8 unembed (reuse d_screen_q8_ when built to avoid duplicate ~505 MB allocation)
     if (use_q8_head_) {
       d_draft_u_q8_ = d_unembed_q8_;
       d_draft_u_sc_ = d_unembed_q8_sc_;
-    } else if ((MH & 31) == 0 && mtp_q8_) {
+    } else if (!d_screen_q8_ && (MH & 31) == 0 && mtp_q8_) {
       d_draft_u_q8_ = static_cast<int8_t*>(alloc_gpu(V * size_t(MH)));
       d_draft_u_sc_ = static_cast<__half*>(alloc_gpu(V * size_t(MH / 32) * sizeof(__half)));
       ink2::launch_quantize_q8_32(u_bf16_for_fold, d_draft_u_q8_, d_draft_u_sc_, int(V), int(MH), stream_);
@@ -1065,6 +1113,69 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     d_mtp_rnn_gates_ = static_cast<float*>(alloc_gpu(3 * size_t(MR) * sizeof(float)));
     d_mtp_logits_ = static_cast<float*>(alloc_gpu((mb - 1) * V * sizeof(float)));
     cuda_ok(cudaMallocHost(&h_mtp_draft_logits_, (mb - 1) * V * sizeof(float)), "cudaMallocHost mtp draft_logits");
+
+    if (use_tree_) {
+      d_beam_h_q8_ = static_cast<int8_t*>(alloc_gpu(7 * size_t(MH)));
+      d_beam_h_sc_ = static_cast<float*>(alloc_gpu(7 * sizeof(float)));
+      d_beam_top_tmp_ids_ = static_cast<int32_t*>(alloc_gpu(7 * 2048 * sizeof(int32_t)));
+      d_beam_top_tmp_vals_ = static_cast<float*>(alloc_gpu(7 * 2048 * sizeof(float)));
+      d_beam_cand_ids_ = static_cast<int32_t*>(alloc_gpu(7 * size_t(kDsparkKCand) * sizeof(int32_t)));
+      d_beam_cand_base_ = static_cast<float*>(alloc_gpu(7 * size_t(kDsparkKCand) * sizeof(float)));
+      d_beam_state_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * size_t(MR) * sizeof(float)));
+      d_beam_state_next_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * size_t(MR) * sizeof(float)));
+      d_beam_prev_tok_ = static_cast<int32_t*>(alloc_gpu(size_t(kBeamW) * sizeof(int32_t)));
+      d_beam_node_ = static_cast<int32_t*>(alloc_gpu(size_t(kBeamW) * sizeof(int32_t)));
+      d_beam_logp_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * sizeof(float)));
+      d_beam_joint_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * size_t(2 * MR + 2 * MH) * sizeof(float)));
+      d_beam_proj_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * 3 * size_t(MR) * sizeof(float)));
+      d_beam_lat_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * size_t(MR) * sizeof(float)));
+      d_beam_corr_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * size_t(MH) * sizeof(float)));
+      d_beam_cand_scores_ = static_cast<float*>(alloc_gpu(size_t(kBeamW) * size_t(kDsparkKCand) * sizeof(float)));
+
+      d_pool_tok_ = static_cast<int32_t*>(alloc_gpu(size_t(kBeamPoolCap) * sizeof(int32_t)));
+      d_pool_parent_ = static_cast<int8_t*>(alloc_gpu(size_t(kBeamPoolCap) * sizeof(int8_t)));
+      d_pool_depth_ = static_cast<uint8_t*>(alloc_gpu(size_t(kBeamPoolCap) * sizeof(uint8_t)));
+      d_pool_logp_ = static_cast<float*>(alloc_gpu(size_t(kBeamPoolCap) * sizeof(float)));
+      d_pool_cnt_ = static_cast<int32_t*>(alloc_gpu(sizeof(int32_t)));
+      cuda_ok(cudaMallocHost(&h_pool_tok_, size_t(kBeamPoolCap) * sizeof(int32_t)), "cudaMallocHost pool_tok");
+      cuda_ok(cudaMallocHost(&h_pool_parent_, size_t(kBeamPoolCap) * sizeof(int8_t)), "cudaMallocHost pool_parent");
+      cuda_ok(cudaMallocHost(&h_pool_depth_, size_t(kBeamPoolCap) * sizeof(uint8_t)), "cudaMallocHost pool_depth");
+      cuda_ok(cudaMallocHost(&h_pool_logp_, size_t(kBeamPoolCap) * sizeof(float)), "cudaMallocHost pool_logp");
+      cuda_ok(cudaMallocHost(&h_pool_cnt_, sizeof(int32_t)), "cudaMallocHost pool_cnt");
+
+      const size_t nv_t = cfg_.schedule.size();
+      const size_t stage_sc_stride = size_t(2 * KVD + 2 * H);
+      d_stage_k_ = static_cast<float*>(alloc_gpu(nv_t * size_t(kMaxTree) * size_t(KVD) * sizeof(float)));
+      d_stage_v_ = static_cast<float*>(alloc_gpu(nv_t * size_t(kMaxTree) * size_t(KVD) * sizeof(float)));
+      d_stage_sconv_ = static_cast<float*>(alloc_gpu(nv_t * size_t(kMaxTree) * stage_sc_stride * sizeof(float)));
+      d_tap_scratch_ = static_cast<float*>(alloc_gpu(4 * size_t(kMaxTree) * size_t(H) * sizeof(float)));
+      d_tree_p1_ = static_cast<int8_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(int8_t)));
+      d_tree_p2_ = static_cast<int8_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(int8_t)));
+      d_tree_p3_ = static_cast<int8_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(int8_t)));
+      d_tree_depth_ = static_cast<uint8_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(uint8_t)));
+      d_tree_anc_mask_ = static_cast<uint32_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(uint32_t)));
+      d_acc_path_ = static_cast<int32_t*>(alloc_gpu(size_t(kMaxTree) * sizeof(int32_t)));
+
+      d_kc_ptrs_ = static_cast<float**>(alloc_gpu(nv_t * sizeof(float*)));
+      d_vc_ptrs_ = static_cast<float**>(alloc_gpu(nv_t * sizeof(float*)));
+      d_kv_cap_ = static_cast<int32_t*>(alloc_gpu(nv_t * sizeof(int32_t)));
+      d_kv_is_swa_ = static_cast<uint8_t*>(alloc_gpu(nv_t * sizeof(uint8_t)));
+      std::vector<float*> kc_h(nv_t), vc_h(nv_t);
+      std::vector<int32_t> kv_cap_h(nv_t);
+      std::vector<uint8_t> kv_swa_h(nv_t);
+      for (size_t v_i = 0; v_i < nv_t; ++v_i) {
+        const bool is_s = cfg_.is_local[size_t(cfg_.schedule[v_i])];
+        kc_h[v_i] = d_kc_[v_i];
+        vc_h[v_i] = d_vc_[v_i];
+        kv_cap_h[v_i] = is_s ? ring_rows_ : max_ctx_;
+        kv_swa_h[v_i] = is_s ? 1 : 0;
+      }
+      cuda_ok(cudaMemcpyAsync(d_kc_ptrs_, kc_h.data(), nv_t * sizeof(float*), cudaMemcpyHostToDevice, stream_), "kc ptrs");
+      cuda_ok(cudaMemcpyAsync(d_vc_ptrs_, vc_h.data(), nv_t * sizeof(float*), cudaMemcpyHostToDevice, stream_), "vc ptrs");
+      cuda_ok(cudaMemcpyAsync(d_kv_cap_, kv_cap_h.data(), nv_t * sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "kv cap");
+      cuda_ok(cudaMemcpyAsync(d_kv_is_swa_, kv_swa_h.data(), nv_t * sizeof(uint8_t), cudaMemcpyHostToDevice, stream_), "kv swa");
+      cuda_ok(cudaStreamSynchronize(stream_), "sync tree tables");
+    }
   }
 
   if (const char* eg = std::getenv("YSKN_INK2_GRAPH")) use_graph_ = (std::strcmp(eg, "0") != 0);
@@ -1076,14 +1187,16 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
 }
 
 void EngineInk2::destroy_graphs() {
-  for (int i = 0; i < 2; ++i) {
-    if (decode_graph_exec_[i]) {
-      cudaGraphExecDestroy(decode_graph_exec_[i]);
-      decode_graph_exec_[i] = nullptr;
-    }
-    if (decode_graph_[i]) {
-      cudaGraphDestroy(decode_graph_[i]);
-      decode_graph_[i] = nullptr;
+  for (int a = 0; a < 2; ++a) {
+    for (int i = 0; i < 2; ++i) {
+      if (decode_graph_exec_[a][i]) {
+        cudaGraphExecDestroy(decode_graph_exec_[a][i]);
+        decode_graph_exec_[a][i] = nullptr;
+      }
+      if (decode_graph_[a][i]) {
+        cudaGraphDestroy(decode_graph_[a][i]);
+        decode_graph_[a][i] = nullptr;
+      }
     }
   }
   for (int k = 0; k < 7; ++k) {
@@ -1098,14 +1211,38 @@ void EngineInk2::destroy_graphs() {
       }
     }
   }
-  for (int m = 0; m < 8; ++m) {
-    if (commit_graph_exec_[m]) {
-      cudaGraphExecDestroy(commit_graph_exec_[m]);
-      commit_graph_exec_[m] = nullptr;
+  for (int r = 0; r < 2; ++r) {
+    for (int m = 0; m < 8; ++m) {
+      if (commit_graph_exec_[r][m]) {
+        cudaGraphExecDestroy(commit_graph_exec_[r][m]);
+        commit_graph_exec_[r][m] = nullptr;
+      }
+      if (commit_graph_[r][m]) {
+        cudaGraphDestroy(commit_graph_[r][m]);
+        commit_graph_[r][m] = nullptr;
+      }
     }
-    if (commit_graph_[m]) {
-      cudaGraphDestroy(commit_graph_[m]);
-      commit_graph_[m] = nullptr;
+  }
+  for (int s = 0; s < 2; ++s) {
+    if (beam_draft_graph_exec_[s]) {
+      cudaGraphExecDestroy(beam_draft_graph_exec_[s]);
+      beam_draft_graph_exec_[s] = nullptr;
+    }
+    if (beam_draft_graph_[s]) {
+      cudaGraphDestroy(beam_draft_graph_[s]);
+      beam_draft_graph_[s] = nullptr;
+    }
+  }
+  for (int b = 0; b < kNumTreeBuckets; ++b) {
+    for (int s = 0; s < 2; ++s) {
+      if (tree_verify_graph_exec_[b][s]) {
+        cudaGraphExecDestroy(tree_verify_graph_exec_[b][s]);
+        tree_verify_graph_exec_[b][s] = nullptr;
+      }
+      if (tree_verify_graph_[b][s]) {
+        cudaGraphDestroy(tree_verify_graph_[b][s]);
+        tree_verify_graph_[b][s] = nullptr;
+      }
     }
   }
 }
@@ -1117,7 +1254,13 @@ void EngineInk2::free_all() noexcept {
   if (h_verify_logits_) cudaFreeHost(h_verify_logits_);
   if (h_tok_) cudaFreeHost(h_tok_);
   if (h_pair_toks_) cudaFreeHost(h_pair_toks_);
+  if (h_tree_next_) cudaFreeHost(h_tree_next_);
   if (h_mtp_draft_logits_) cudaFreeHost(h_mtp_draft_logits_);
+  if (h_pool_tok_) cudaFreeHost(h_pool_tok_);
+  if (h_pool_parent_) cudaFreeHost(h_pool_parent_);
+  if (h_pool_depth_) cudaFreeHost(h_pool_depth_);
+  if (h_pool_logp_) cudaFreeHost(h_pool_logp_);
+  if (h_pool_cnt_) cudaFreeHost(h_pool_cnt_);
   if (cublas_) cublasDestroy(cublas_);
   for (void* p : gpu_allocs_) cudaFree(p);
   if (stream_) cudaStreamDestroy(stream_);
@@ -1125,7 +1268,13 @@ void EngineInk2::free_all() noexcept {
   h_verify_logits_ = nullptr;
   h_tok_ = nullptr;
   h_pair_toks_ = nullptr;
+  h_tree_next_ = nullptr;
   h_mtp_draft_logits_ = nullptr;
+  h_pool_tok_ = nullptr;
+  h_pool_parent_ = nullptr;
+  h_pool_depth_ = nullptr;
+  h_pool_logp_ = nullptr;
+  h_pool_cnt_ = nullptr;
   cublas_ = nullptr;
   gpu_allocs_.clear();
   stream_ = nullptr;
@@ -1177,7 +1326,7 @@ void EngineInk2::set_suppress(const int32_t* token_ids, int n_tokens) {
 
 void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_logits,
                                 bool capture_taps, bool save_snaps, bool need_all_logits,
-                                const int32_t* d_pos_ptr_arg) {
+                                const int32_t* d_pos_ptr_arg, bool greedy_argmax_only) {
   if (T <= 0 || T > kPrefillChunk) throw std::runtime_error("invalid Inkling2 chunk size");
   if (pos0 + T > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + ")");
 
@@ -1188,6 +1337,7 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
   const size_t row_bytes = size_t(T) * size_t(H) * sizeof(float);
   const float sconv_static_scale = 1.0f / std::sqrt(5.0f);
   const float ar_scale = 1.0f / std::sqrt(float(H));
+  const bool use_scr_argmax = greedy_argmax_only && use_screen_head_ && !need_all_logits;
 
   if (ids != nullptr) {
     cuda_ok(cudaMemcpyAsync(d_tokens_, ids, size_t(T) * sizeof(int32_t), cudaMemcpyHostToDevice, stream_),
@@ -1499,6 +1649,13 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
       }
       ink2::launch_softcap(d_verify_logits_, T * cfg_.vocab, cfg_.logit_softcap, stream_);
       if (suppress_active_) ink2::launch_suppress_mask_rows(d_verify_logits_, T, cfg_.vocab, d_suppress_, stream_);
+    } else if (use_scr_argmax) {
+      const float* h_last = d_h_norm_ + size_t(T - 1) * size_t(H);
+      ink2::launch_screen_argmax_bf16(
+          static_cast<const __nv_bfloat16*>(unembed_.d_ptr), d_screen_q8_, d_screen_sc_, d_screen_eps_, h_last, 1,
+          cfg_.vocab, H, suppress_active_ ? d_suppress_ : nullptr, d_screen_hnorm_, d_screen_max_lb_,
+          d_screen_dot_hat_, d_screen_cand_ids_, d_screen_cand_cnt_, kScreenMaxCand, cfg_.logit_softcap, d_tok_out_,
+          stream_);
     } else {
       const float* h_last = d_h_norm_ + size_t(T - 1) * size_t(H);
       if (use_q8_head_) {
@@ -1512,25 +1669,493 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
     }
   };
 
+  const int argmax_idx = use_scr_argmax ? 1 : 0;
   if (d_pos_ptr_arg != nullptr) {
     run_forward_body(d_pos_ptr_arg);
   } else if (T == 1 && need_logits && !need_all_logits && !capture_taps && !save_snaps && use_graph_) {
     const int sup_idx = suppress_active_ ? 1 : 0;
     const int32_t sp = int32_t(pos0);
     cuda_ok(cudaMemcpyAsync(d_step_pos_, &sp, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload step pos");
-    if (!decode_graph_exec_[sup_idx]) {
+    if (!decode_graph_exec_[argmax_idx][sup_idx]) {
       cuda_ok(cudaStreamSynchronize(stream_), "sync before graph capture");
       cuda_ok(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin graph capture");
       run_forward_body(d_step_pos_);
-      cuda_ok(cudaStreamEndCapture(stream_, &decode_graph_[sup_idx]), "end graph capture");
-      cuda_ok(cudaGraphInstantiate(&decode_graph_exec_[sup_idx], decode_graph_[sup_idx], nullptr, nullptr, 0),
+      cuda_ok(cudaStreamEndCapture(stream_, &decode_graph_[argmax_idx][sup_idx]), "end graph capture");
+      cuda_ok(cudaGraphInstantiate(&decode_graph_exec_[argmax_idx][sup_idx], decode_graph_[argmax_idx][sup_idx],
+                                   nullptr, nullptr, 0),
               "instantiate graph");
     }
-    cuda_ok(cudaGraphLaunch(decode_graph_exec_[sup_idx], stream_), "launch decode graph");
+    cuda_ok(cudaGraphLaunch(decode_graph_exec_[argmax_idx][sup_idx], stream_), "launch decode graph");
   } else {
     run_forward_body(nullptr);
   }
-  if (need_logits && !need_all_logits) logits_valid_ = true;
+  if (need_logits && !need_all_logits) logits_valid_ = !use_scr_argmax;
+}
+
+void EngineInk2::forward_tree_verify(int M, int pos0, const int32_t* d_pos_ptr) {
+  const int H = cfg_.hidden;
+  const int QD = cfg_.hq * cfg_.head_dim;
+  const int KVD = cfg_.hkv * cfg_.head_dim;
+  const int stage_stride = 2 * KVD + 2 * H;
+  const float sconv_static_scale = 1.0f / std::sqrt(5.0f);
+  const float ar_scale = 1.0f / std::sqrt(float(H));
+
+  ink2::launch_embed_norm(d_tokens_, 0, static_cast<const __nv_bfloat16*>(embed_.d_ptr),
+                          static_cast<const __nv_bfloat16*>(embed_norm_.d_ptr), d_x_, M, H, cfg_.rms_eps, stream_);
+
+  const float* blocks_vec[6] = {};
+  int n_blocks = 0;
+  bool have_prelude = false;
+  bool have_prev = false;
+  int n_prelude_blocks = 0;
+  const size_t row_bytes = size_t(M) * size_t(H) * sizeof(float);
+
+  for (size_t v_idx = 0; v_idx < cfg_.schedule.size(); ++v_idx) {
+    const int ip = cfg_.schedule[v_idx];
+    const Ink2Layer& L = layers_[size_t(ip)];
+    float* conv_k = d_conv_[v_idx] + 0;
+    float* conv_v = d_conv_[v_idx] + 3 * KVD;
+    float* conv_a = d_conv_[v_idx] + 6 * KVD;
+    float* conv_m = d_conv_[v_idx] + 6 * KVD + 3 * H;
+    float* stage_v_sc = d_stage_sconv_ + v_idx * size_t(kMaxTree) * size_t(stage_stride);
+    float* stage_k_v = d_stage_k_ + v_idx * size_t(kMaxTree) * size_t(KVD);
+    float* stage_v_v = d_stage_v_ + v_idx * size_t(kMaxTree) * size_t(KVD);
+
+    if (ip == cfg_.core_start) {
+      if (!have_prelude) {
+        cuda_ok(cudaMemcpyAsync(d_x_pre_, d_x_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "copy tree x_pre");
+        n_prelude_blocks = n_blocks;
+        if (n_prelude_blocks > cfg_.core_start / cfg_.block_sz) {
+          for (int b = 0; b < n_prelude_blocks; ++b)
+            cuda_ok(cudaMemcpyAsync(d_pre_blocks_[b], blocks_vec[b], row_bytes, cudaMemcpyDeviceToDevice, stream_),
+                    "copy tree pre_block");
+        }
+        have_prelude = true;
+      } else {
+        cuda_ok(cudaMemcpyAsync(d_blocks_[4], blocks_vec[n_prelude_blocks + 1], row_bytes,
+                                cudaMemcpyDeviceToDevice, stream_),
+                "copy tree bank0");
+        ink2::launch_rmsnorm(d_x_, nullptr, true, d_blocks_[5], M, H, cfg_.rms_eps, stream_);
+        cuda_ok(cudaMemcpyAsync(d_x_, d_x_pre_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "restore tree x_pre");
+        n_blocks = n_prelude_blocks;
+        if (n_prelude_blocks > cfg_.core_start / cfg_.block_sz) {
+          for (int b = 0; b < n_prelude_blocks; ++b) {
+            cuda_ok(cudaMemcpyAsync(d_blocks_[b], d_pre_blocks_[b], row_bytes, cudaMemcpyDeviceToDevice, stream_),
+                    "restore tree pre_block");
+            blocks_vec[b] = d_blocks_[b];
+          }
+        }
+        have_prev = true;
+      }
+    }
+
+    if (mtp_enabled_) {
+      for (int ti = 0; ti < 3; ++ti) {
+        if (int(v_idx) == mtp_cfg_.taps[ti]) {
+          cuda_ok(cudaMemcpyAsync(d_tap_[ti], d_x_, row_bytes, cudaMemcpyDeviceToDevice, stream_), "capture tree tap");
+        }
+      }
+    }
+
+    const bool has_msgs = have_prev && ip < cfg_.core_end;
+    const float* msg_m0 = d_msg_out_ + 0 * size_t(M) * size_t(H);
+    const float* msg_m1 = d_msg_out_ + 1 * size_t(M) * size_t(H);
+    const float* msg_m2 = d_msg_out_ + 2 * size_t(M) * size_t(H);
+    const float* msg_mlp = d_msg_out_ + 3 * size_t(M) * size_t(H);
+    if (has_msgs) {
+      const float* bank[2] = {d_blocks_[4], d_blocks_[5]};
+      const float* qv = d_msg_queries_ + size_t(ip - cfg_.core_start) * 4 * size_t(H);
+      ink2::launch_attn_res(bank, 2, 0x3u, qv, true, 4, d_msg_out_, M, H, cfg_.rms_eps, ar_scale, stream_);
+    }
+
+    const float* in_ptrs[3];
+    bool fused_attn_norm = false;
+    if (ip == 0) {
+      in_ptrs[0] = in_ptrs[1] = in_ptrs[2] = d_x_;
+    } else {
+      const float* st[6];
+      for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
+      st[n_blocks] = d_x_;
+      const Ink2Tensor& aq = attn_queries_[size_t(ip - 1)];
+      const int nq = (aq.cols == 1) ? 1 : aq.rows;
+      const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
+      if (!has_msgs && L.is_swa && nq == 1) {
+        ink2::launch_attn_res(st, n_blocks + 1, st_mask, aq.d_ptr, aq.f32, 1, d_n0_, M, H, cfg_.rms_eps, ar_scale,
+                              stream_, L.attn_norm.d_ptr, L.attn_norm.f32);
+        fused_attn_norm = true;
+        in_ptrs[0] = in_ptrs[1] = in_ptrs[2] = d_n0_;
+      } else {
+        ink2::launch_attn_res(st, n_blocks + 1, st_mask, aq.d_ptr, aq.f32, nq, d_ar_out_, M, H, cfg_.rms_eps,
+                              ar_scale, stream_);
+        if (nq == 1) {
+          in_ptrs[0] = in_ptrs[1] = in_ptrs[2] = d_ar_out_;
+        } else {
+          in_ptrs[0] = d_ar_out_ + 0 * size_t(M) * size_t(H);
+          in_ptrs[1] = d_ar_out_ + 1 * size_t(M) * size_t(H);
+          in_ptrs[2] = d_ar_out_ + 2 * size_t(M) * size_t(H);
+        }
+      }
+    }
+
+    if (has_msgs) {
+      const ink2::MsgGateItem items[3] = {
+          {in_ptrs[0], msg_m0, static_cast<const __nv_bfloat16*>(L.ctrl_attn.down.d_ptr),
+           static_cast<const __nv_bfloat16*>(L.ctrl_attn.forget.d_ptr),
+           static_cast<const __nv_bfloat16*>(L.ctrl_attn.gain.d_ptr), d_n0_},
+          {in_ptrs[1], msg_m1, static_cast<const __nv_bfloat16*>(L.ctrl_k.down.d_ptr),
+           static_cast<const __nv_bfloat16*>(L.ctrl_k.forget.d_ptr),
+           static_cast<const __nv_bfloat16*>(L.ctrl_k.gain.d_ptr), d_n1_},
+          {in_ptrs[2], msg_m2, static_cast<const __nv_bfloat16*>(L.ctrl_v.down.d_ptr),
+           static_cast<const __nv_bfloat16*>(L.ctrl_v.forget.d_ptr),
+           static_cast<const __nv_bfloat16*>(L.ctrl_v.gain.d_ptr), d_n2_},
+      };
+      ink2::launch_msg_gate_x3(items, d_mg_nhm_, d_mg_g_, M, H, cfg_.gate_rank, cfg_.rms_eps, stream_);
+      if (L.is_swa) {
+        ink2::launch_rmsnorm_x3(d_n0_, d_n1_, d_n2_, L.attn_norm.d_ptr, L.attn_norm.d_ptr, L.attn_norm.d_ptr,
+                                L.attn_norm.f32, d_n0_, d_n1_, d_n2_, M, H, cfg_.rms_eps, stream_);
+      } else {
+        ink2::launch_rmsnorm_x3(d_n0_, d_n1_, d_n2_, L.q_norm.d_ptr, L.k_norm.d_ptr, L.v_norm.d_ptr,
+                                L.q_norm.f32, d_n0_, d_n1_, d_n2_, M, H, cfg_.rms_eps, stream_);
+      }
+    } else if (L.is_swa) {
+      if (!fused_attn_norm) {
+        ink2::launch_rmsnorm(in_ptrs[0], L.attn_norm.d_ptr, L.attn_norm.f32, d_n0_, M, H, cfg_.rms_eps, stream_);
+      }
+    } else {
+      ink2::launch_rmsnorm_x3(in_ptrs[0], in_ptrs[1], in_ptrs[2], L.q_norm.d_ptr, L.k_norm.d_ptr, L.v_norm.d_ptr,
+                              L.q_norm.f32, d_n0_, d_n1_, d_n2_, M, H, cfg_.rms_eps, stream_);
+    }
+
+    const float* kn = (has_msgs || !L.is_swa) ? d_n1_ : d_n0_;
+    const float* vn = (has_msgs || !L.is_swa) ? d_n2_ : d_n0_;
+    auto mm = [&](const Ink2Tensor& w, const float* x, float* y) {
+      ink2::launch_linear(cublas_, x, w.d_ptr, w.f32, d_x_bf16_, y, M, w.rows, w.cols, false, stream_);
+    };
+
+    if (L.is_swa && !has_msgs && L.fused_qkvrsg) {
+      const ink2::MultiLinearSeg segs[6] = {
+          {d_q_, L.wq_du.rows}, {d_r_, L.wr_du.rows}, {d_sinks_, L.attn_sink_proj.rows},
+          {d_gate_attn_, L.gate_attn.rows}, {d_k_, L.wk_dv.rows}, {d_v_, L.wv_dv.rows},
+      };
+      ink2::launch_linear_multi(cublas_, d_n0_, L.w_qkvrsg, d_x_bf16_, d_qkvrsg_tmp_, segs, 6, M, H, stream_);
+    } else {
+      if (L.fused_qrsg) {
+        const ink2::MultiLinearSeg segs[4] = {
+            {d_q_, L.wq_du.rows}, {d_r_, L.wr_du.rows}, {d_sinks_, L.attn_sink_proj.rows}, {d_gate_attn_, L.gate_attn.rows},
+        };
+        ink2::launch_linear_multi(cublas_, d_n0_, L.w_qkvrsg, d_x_bf16_, d_qkvrsg_tmp_, segs, 4, M, H, stream_);
+      } else {
+        mm(L.wq_du, d_n0_, d_q_);
+        mm(L.wr_du, d_n0_, d_r_);
+        mm(L.attn_sink_proj, d_n0_, d_sinks_);
+        mm(L.gate_attn, d_n0_, d_gate_attn_);
+      }
+      if (L.is_swa || !L.fused_kvp) {
+        mm(L.wk_dv, kn, d_k_);
+        mm(L.wv_dv, vn, d_v_);
+      }
+    }
+
+    if (L.is_swa) {
+      ink2::launch_sconv_static_kv_tree(d_k_, L.k_sconv.d_ptr, L.k_sconv.f32, conv_k,
+                                        d_v_, L.v_sconv.d_ptr, L.v_sconv.f32, conv_v,
+                                        stage_v_sc, stage_stride, d_tree_p1_, d_tree_p2_, d_tree_p3_,
+                                        M, KVD, sconv_static_scale, stream_);
+    } else {
+      if (L.fused_kvp) {
+        const ink2::MultiLinearSeg ksegs[2] = {{d_k_, L.wk_dv.rows}, {d_dyn_, L.k_proj.rows}};
+        ink2::launch_linear_multi(cublas_, kn, L.w_kkp, d_x_bf16_, d_qkvrsg_tmp_, ksegs, 2, M, H, stream_);
+      } else {
+        mm(L.k_proj, kn, d_dyn_);
+      }
+      ink2::launch_sconv_dynamic_tree(d_k_, d_dyn_, L.k_static.d_ptr, L.k_static.f32, conv_k, d_k_,
+                                      stage_v_sc, stage_stride, 0, d_tree_p1_, d_tree_p2_, d_tree_p3_,
+                                      M, KVD, cfg_.hkv, stream_);
+      if (L.fused_kvp) {
+        const ink2::MultiLinearSeg vsegs[2] = {{d_v_, L.wv_dv.rows}, {d_dyn_, L.v_proj.rows}};
+        ink2::launch_linear_multi(cublas_, vn, L.w_vvp, d_x_bf16_, d_qkvrsg_tmp_, vsegs, 2, M, H, stream_);
+      } else {
+        mm(L.v_proj, vn, d_dyn_);
+      }
+      ink2::launch_sconv_dynamic_tree(d_v_, d_dyn_, L.v_static.d_ptr, L.v_static.f32, conv_v, d_v_,
+                                      stage_v_sc, stage_stride, KVD, d_tree_p1_, d_tree_p2_, d_tree_p3_,
+                                      M, KVD, cfg_.hkv, stream_);
+    }
+
+    const int kv_cap = L.is_swa ? ring_rows_ : max_ctx_;
+    ink2::launch_qkvr_prep_tree(d_q_, d_k_, d_v_, d_r_, L.q_scale.d_ptr, L.rel_scale.d_ptr, L.q_scale.f32,
+                                stage_k_v, stage_v_v, M, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.d_rel,
+                                pos0, d_pos_ptr, d_tree_depth_, cfg_.qk_clip, cfg_.rel_clip, cfg_.rms_eps,
+                                cfg_.log_floor, cfg_.log_alpha, L.is_swa, stream_);
+    ink2::launch_rel_bias(cublas_, d_r_, L.rel_proj.d_ptr, L.rel_proj.f32, d_x_bf16_, d_rb_, M, cfg_.hq,
+                          cfg_.d_rel, cfg_.rel_extent, stream_);
+    ink2::launch_attn_tree(d_q_, d_kc_[v_idx], d_vc_[v_idx], stage_k_v, stage_v_v, d_rb_, d_sinks_, d_gate_attn_,
+                           d_part_m_, d_part_l_, d_part_o_, d_att_out_, M, pos0, d_pos_ptr, d_tree_depth_,
+                           d_tree_anc_mask_, kv_cap, cfg_.hq, cfg_.hkv, cfg_.head_dim, cfg_.rel_extent,
+                           L.is_swa, cfg_.swa, stream_);
+
+    mm(L.wo_ud, d_att_out_, d_a_out_);
+    const float* ffn_ptr = d_a_out_;
+    if (ip % cfg_.block_sz == 0) {
+      ink2::launch_sconv_static_tree(d_a_out_, L.attn_sconv.d_ptr, L.attn_sconv.f32, conv_a, d_a_out_,
+                                     stage_v_sc, stage_stride, 2 * KVD, d_tree_p1_, d_tree_p2_, d_tree_p3_,
+                                     M, H, sconv_static_scale, nullptr, stream_);
+      const int bslot = ip / cfg_.block_sz;
+      ink2::launch_rmsnorm(d_x_, nullptr, true, d_blocks_[bslot], M, H, cfg_.rms_eps, stream_);
+      blocks_vec[size_t(n_blocks++)] = d_blocks_[bslot];
+    } else {
+      ink2::launch_sconv_static_tree(d_a_out_, L.attn_sconv.d_ptr, L.attn_sconv.f32, conv_a, d_ffn_inp_,
+                                     stage_v_sc, stage_stride, 2 * KVD, d_tree_p1_, d_tree_p2_, d_tree_p3_,
+                                     M, H, sconv_static_scale, d_x_, stream_);
+      ffn_ptr = d_ffn_inp_;
+    }
+
+    if (has_msgs) {
+      const float* st[6];
+      for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
+      st[n_blocks] = ffn_ptr;
+      const Ink2Tensor& mq = mlp_queries_[size_t(ip)];
+      const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
+      ink2::launch_attn_res(st, n_blocks + 1, st_mask, mq.d_ptr, mq.f32, 1, d_h_mlp_, M, H, cfg_.rms_eps, ar_scale, stream_);
+      ink2::launch_msg_gate(cublas_, d_h_mlp_, msg_mlp, static_cast<const __nv_bfloat16*>(L.ctrl_mlp.down.d_ptr),
+                            static_cast<const __nv_bfloat16*>(L.ctrl_mlp.forget.d_ptr),
+                            static_cast<const __nv_bfloat16*>(L.ctrl_mlp.gain.d_ptr),
+                            d_mg_nhm_, d_mg_nhm_bf16_, d_mg_g_, d_mg_g_bf16_, d_mg_df_, d_mg_dg_,
+                            d_h_mlp_, M, H, cfg_.gate_rank, cfg_.rms_eps, stream_);
+      ink2::launch_rmsnorm(d_h_mlp_, L.mlp_norm.d_ptr, L.mlp_norm.f32, d_x_mlp_, M, H, cfg_.rms_eps, stream_);
+    } else {
+      const float* st[6];
+      for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
+      st[n_blocks] = ffn_ptr;
+      const Ink2Tensor& mq = mlp_queries_[size_t(ip)];
+      const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
+      ink2::launch_attn_res(st, n_blocks + 1, st_mask, mq.d_ptr, mq.f32, 1, d_x_mlp_, M, H, cfg_.rms_eps, ar_scale,
+                            stream_, L.mlp_norm.d_ptr, L.mlp_norm.f32);
+    }
+
+    mm(L.router_w, d_x_mlp_, d_rlog_);
+    ink2::launch_moe_route(d_rlog_, L.router_bias.d_ptr, L.router_bias.f32, d_eid_, d_ew_, M, cfg_.n_experts,
+                           cfg_.top_k, cfg_.route_scale, stream_);
+    const ink2::MoeGroupBufs gbuf{d_moe_pair_idx_, d_moe_tile_exp_, d_moe_tile_m0_, d_moe_tile_cnt_, d_moe_num_tiles_};
+    if (!L.is_mxfp8) {
+      ink2::launch_moe_nvfp4(d_x_mlp_, d_eid_, d_ew_, L.w13, L.w13_sc, L.w13_outer, L.w2, L.w2_sc, L.w2_outer,
+                             d_moe_act_, d_moe_pair_out_, d_moe_out_, M, H, cfg_.moe_I, cfg_.top_k,
+                             &gbuf, cfg_.n_experts, stream_);
+    } else {
+      ink2::launch_moe_mxfp8(d_x_mlp_, d_eid_, d_ew_, L.w13, L.w13_sc, L.w2, L.w2_sc,
+                             d_moe_act_, d_moe_pair_out_, d_moe_out_, M, H, cfg_.moe_I, cfg_.top_k,
+                             &gbuf, cfg_.n_experts, stream_);
+    }
+
+    ink2::launch_sconv_static_tree(d_moe_out_, L.mlp_sconv.d_ptr, L.mlp_sconv.f32, conv_m, d_x_,
+                                   stage_v_sc, stage_stride, 2 * KVD + H, d_tree_p1_, d_tree_p2_, d_tree_p3_,
+                                   M, H, sconv_static_scale, ffn_ptr, stream_);
+  }
+
+  {
+    const float* st[6];
+    for (int b = 0; b < n_blocks; ++b) st[b] = blocks_vec[b];
+    st[n_blocks] = d_x_;
+    const uint32_t st_mask = (n_blocks > 0) ? ((1u << n_blocks) - 1u) : 0u;
+    ink2::launch_attn_res(st, n_blocks + 1, st_mask, output_query_.d_ptr, output_query_.f32, 1, d_h_norm_, M, H,
+                          cfg_.rms_eps, ar_scale, stream_, final_norm_.d_ptr, final_norm_.f32);
+  }
+
+  ink2::launch_screen_argmax_bf16(
+      static_cast<const __nv_bfloat16*>(unembed_.d_ptr), d_screen_q8_, d_screen_sc_, d_screen_eps_, d_h_norm_, M,
+      cfg_.vocab, H, suppress_active_ ? d_suppress_ : nullptr, d_screen_hnorm_, d_screen_max_lb_,
+      d_screen_dot_hat_, d_screen_cand_ids_, d_screen_cand_cnt_, kScreenMaxCand, cfg_.logit_softcap,
+      d_verify_samples_, stream_);
+}
+
+void EngineInk2::draft_beam_tree(int32_t anchor_tok, int pos0, int max_nodes, int room, TreeSpec& out_tree) {
+  const int B = mtp_cfg_.block;
+  const int H = mtp_cfg_.hidden;
+  const int R = mtp_cfg_.markov_rank;
+  const int V = cfg_.vocab;
+  const int QD = mtp_cfg_.hq * mtp_cfg_.head_dim;
+  const int KVD = mtp_cfg_.hkv * mtp_cfg_.head_dim;
+  const int sup_idx = suppress_active_ ? 1 : 0;
+
+  cuda_ok(cudaMemcpyAsync(d_tokens_, &anchor_tok, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload beam anc");
+  const int32_t sp = int32_t(pos0);
+  cuda_ok(cudaMemcpyAsync(d_step_pos_, &sp, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload beam pos");
+
+  auto emit_beam_draft = [&]() {
+    ink2::launch_mtp_prep_block(d_tokens_, static_cast<const __nv_bfloat16*>(embed_.d_ptr),
+                                static_cast<const __nv_bfloat16*>(embed_norm_.d_ptr),
+                                static_cast<const __nv_bfloat16*>(mtp_mask_embed_.d_ptr),
+                                d_mtp_blk_x_, B, H, mtp_cfg_.rms_eps, stream_);
+    for (int i = 0; i < mtp_cfg_.num_layers; ++i) {
+      const Ink2MtpLayer& L = mtp_layers_[size_t(i)];
+      ink2::launch_rmsnorm(d_mtp_blk_x_, L.in_norm.d_ptr, L.in_norm.f32, d_mtp_blk_norm_, B, H, mtp_cfg_.rms_eps, stream_);
+      const ink2::MultiLinearSeg qkv_segs[3] = {{d_mtp_blk_q_, QD}, {d_mtp_blk_k_, KVD}, {d_mtp_blk_v_, KVD}};
+      ink2::launch_linear_multi(cublas_, d_mtp_blk_norm_, L.w_qkv, d_x_bf16_, d_mtp_qkv_tmp_, qkv_segs, 3, B, H, stream_);
+      const int kv_cap = L.is_local ? ring_rows_ : max_ctx_;
+      ink2::launch_mtp_qk_rope_cache(d_mtp_blk_q_, d_mtp_blk_k_, d_mtp_blk_v_,
+                                     static_cast<const __nv_bfloat16*>(L.q_norm.d_ptr),
+                                     static_cast<const __nv_bfloat16*>(L.k_norm.d_ptr),
+                                     d_mtp_kc_[i], d_mtp_vc_[i], B, mtp_cfg_.hq, mtp_cfg_.hkv, mtp_cfg_.head_dim,
+                                     0, d_step_pos_, kv_cap, L.is_local, true, mtp_cfg_.rms_eps, mtp_cfg_.rope_theta,
+                                     stream_);
+      ink2::launch_mtp_attn(d_mtp_blk_q_, d_mtp_kc_[i], d_mtp_vc_[i], d_mtp_blk_k_, d_mtp_blk_v_, d_mtp_blk_att_,
+                            B, 0, d_step_pos_, kv_cap, mtp_cfg_.hq, mtp_cfg_.hkv, mtp_cfg_.head_dim,
+                            L.is_local, mtp_cfg_.swa, stream_);
+      ink2::launch_linear(cublas_, d_mtp_blk_att_, L.o_proj.d_ptr, L.o_proj.f32, d_x_bf16_, d_mtp_blk_out_,
+                          B, H, QD, false, stream_);
+      ink2::launch_mtp_res_add_bf16(d_mtp_blk_x_, d_mtp_blk_out_, d_mtp_blk_res_, B * H, stream_);
+      ink2::launch_rmsnorm(d_mtp_blk_res_, L.ff_norm.d_ptr, L.ff_norm.f32, d_mtp_blk_norm_, B, H, mtp_cfg_.rms_eps, stream_);
+      ink2::launch_mtp_gate_up_swiglu(d_mtp_blk_norm_, L.w_gu, d_mtp_blk_gate_, B, mtp_cfg_.ffn, H, stream_);
+      ink2::launch_linear(cublas_, d_mtp_blk_gate_, L.down_proj.d_ptr, L.down_proj.f32, d_x_bf16_, d_mtp_blk_out_,
+                          B, H, mtp_cfg_.ffn, false, stream_);
+      ink2::launch_mtp_res_add_bf16(d_mtp_blk_res_, d_mtp_blk_out_, d_mtp_blk_x_, B * H, stream_);
+    }
+    ink2::launch_rmsnorm(d_mtp_blk_x_, mtp_norm_.d_ptr, mtp_norm_.f32, d_mtp_blk_norm_, B, H, mtp_cfg_.rms_eps, stream_);
+    ink2::launch_dspark_screen_dp4a7(d_screen_q8_, d_screen_sc_, d_mtp_blk_norm_ + H, d_beam_h_q8_, d_beam_h_sc_,
+                                     suppress_active_ ? d_suppress_ : nullptr, d_mtp_logits_, V, H, stream_);
+    ink2::launch_dspark_top_cand(d_mtp_logits_, V, kDsparkKCand, d_beam_top_tmp_ids_, d_beam_top_tmp_vals_,
+                                 d_beam_cand_ids_, nullptr, stream_);
+    ink2::launch_dspark_beam_init(d_tokens_, d_beam_state_, d_beam_prev_tok_, d_beam_logp_, d_beam_node_,
+                                  d_pool_tok_, d_pool_parent_, d_pool_depth_, d_pool_logp_, d_pool_cnt_, stream_);
+    for (int s = 0; s < 7; ++s) {
+      const int nw = (s == 0) ? 1 : kBeamW;
+      const float* hs = d_mtp_blk_norm_ + size_t(1 + s) * size_t(H);
+      ink2::launch_dspark_markov_prep_batch(
+          d_beam_prev_tok_, d_beam_state_, hs, d_mtp_rec_feat_,
+          static_cast<const __nv_bfloat16*>(mtp_markov_w1_.d_ptr), d_beam_joint_, nw, R, H, stream_);
+      ink2::launch_linear(cublas_, d_beam_joint_, mtp_rnn_proj_w_.d_ptr, mtp_rnn_proj_w_.f32, d_x_bf16_, d_beam_proj_,
+                          nw, 3 * R, 2 * R + 2 * H, false, stream_);
+      ink2::launch_dspark_markov_update_batch(
+          d_beam_proj_, static_cast<const __nv_bfloat16*>(mtp_rnn_proj_b_.d_ptr),
+          d_beam_state_, d_beam_state_next_, d_beam_lat_, nw, R, stream_);
+      ink2::launch_linear(cublas_, d_beam_lat_, mtp_hidden_out_w_.d_ptr, mtp_hidden_out_w_.f32, d_x_bf16_, d_beam_corr_,
+                          nw, H, R, false, stream_);
+      ink2::launch_dspark_add_bias_h_batch(d_beam_corr_, d_mtp_ho_b_, hs, nw, H, stream_);
+      ink2::launch_dspark_score_cand_dp4a_batch(
+          d_screen_q8_, d_screen_sc_, d_beam_corr_, d_beam_cand_ids_ + size_t(s) * size_t(kDsparkKCand),
+          suppress_active_ ? d_suppress_ : nullptr, kDsparkKCand, nw, cfg_.logit_softcap, d_beam_cand_scores_, stream_);
+      ink2::launch_dspark_beam_expand(
+          d_beam_cand_scores_, d_beam_cand_ids_ + size_t(s) * size_t(kDsparkKCand), d_beam_state_next_, kDsparkKCand,
+          nw, kBeamW, s + 1, d_beam_state_, d_beam_prev_tok_, d_beam_logp_, d_beam_node_, d_pool_tok_,
+          d_pool_parent_, d_pool_depth_, d_pool_logp_, d_pool_cnt_, stream_);
+    }
+  };
+
+  if (use_graph_) {
+    if (!beam_draft_graph_exec_[sup_idx]) {
+      cuda_ok(cudaStreamSynchronize(stream_), "sync before beam draft graph");
+      cuda_ok(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin beam draft graph");
+      emit_beam_draft();
+      cuda_ok(cudaStreamEndCapture(stream_, &beam_draft_graph_[sup_idx]), "end beam draft graph");
+      cuda_ok(cudaGraphInstantiate(&beam_draft_graph_exec_[sup_idx], beam_draft_graph_[sup_idx],
+                                   nullptr, nullptr, 0),
+              "instantiate beam draft graph");
+    }
+    cuda_ok(cudaGraphLaunch(beam_draft_graph_exec_[sup_idx], stream_), "launch beam draft graph");
+  } else {
+    emit_beam_draft();
+  }
+
+  cuda_ok(cudaMemcpyAsync(h_pool_cnt_, d_pool_cnt_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_), "copy pool cnt");
+  cuda_ok(cudaMemcpyAsync(h_pool_tok_, d_pool_tok_, size_t(kBeamPoolCap) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream_), "copy pool tok");
+  cuda_ok(cudaMemcpyAsync(h_pool_parent_, d_pool_parent_, size_t(kBeamPoolCap) * sizeof(int8_t), cudaMemcpyDeviceToHost, stream_), "copy pool par");
+  cuda_ok(cudaMemcpyAsync(h_pool_depth_, d_pool_depth_, size_t(kBeamPoolCap) * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream_), "copy pool dep");
+  cuda_ok(cudaMemcpyAsync(h_pool_logp_, d_pool_logp_, size_t(kBeamPoolCap) * sizeof(float), cudaMemcpyDeviceToHost, stream_), "copy pool lp");
+  cuda_ok(cudaStreamSynchronize(stream_), "sync beam pool");
+
+  const int cnt = std::min(kBeamPoolCap, std::max(1, *h_pool_cnt_));
+  int ord[kBeamPoolCap];
+  int n_cand = 0;
+  for (int i = 1; i < cnt; ++i) {
+    if (int(h_pool_depth_[i]) <= room && h_pool_logp_[i] > -1e20f) ord[n_cand++] = i;
+  }
+  std::sort(ord, ord + n_cand, [&](int a, int b) {
+    if (h_pool_logp_[a] != h_pool_logp_[b]) return h_pool_logp_[a] > h_pool_logp_[b];
+    if (h_pool_depth_[a] != h_pool_depth_[b]) return h_pool_depth_[a] < h_pool_depth_[b];
+    return a < b;
+  });
+
+  const int max_usable = std::min(max_nodes, 1 + n_cand);
+  static constexpr int kBuckets[kNumTreeBuckets] = {3, 4, 5, 6, 8, 10, 12};
+  double pref_p[kBeamPoolCap + 1];
+  pref_p[0] = 1.0;
+  for (int i = 0; i < n_cand; ++i) {
+    const float lp = h_pool_logp_[ord[i]];
+    pref_p[i + 1] = pref_p[i] + ((lp > -20.0f) ? std::exp(double(lp)) : 0.0);
+  }
+  double best_rate = -1.0;
+  int best_m = 0;
+  for (int mb : kBuckets) {
+    if (mb > max_usable) continue;
+    const double e_tok = pref_p[mb - 1];
+    const double exp_frac = 1.0 - std::pow(15.0 / 16.0, double(mb));
+    const double rate = e_tok / (1.0 + double(moe_ratio_) * exp_frac);
+    if (rate > best_rate) {
+      best_rate = rate;
+      best_m = mb;
+    }
+  }
+  if (best_m < 3) {
+    out_tree = TreeSpec{};
+    return;
+  }
+
+  uint8_t keep[kBeamPoolCap] = {};
+  keep[0] = 1;
+  int n_kept = 1;
+  for (int i = 0; i < n_cand && n_kept < best_m; ++i) {
+    const int u = ord[i];
+    if (!keep[u]) {
+      const int par = int(h_pool_parent_[u]);
+      if (par >= 0 && keep[par]) {
+        keep[u] = 1;
+        ++n_kept;
+      }
+    }
+  }
+  // If pruning to connected nodes produced fewer than best_m, snap down to the largest valid bucket <= n_kept
+  if (n_kept < best_m) {
+    int snapped = 0;
+    for (int mb : kBuckets) {
+      if (mb <= n_kept) snapped = mb;
+    }
+    if (snapped < 3) {
+      out_tree = TreeSpec{};
+      return;
+    }
+    if (n_kept > snapped) {
+      int dropped = 0;
+      const int need_drop = n_kept - snapped;
+      for (int i = n_cand - 1; i >= 0 && dropped < need_drop; --i) {
+        const int u = ord[i];
+        if (!keep[u]) continue;
+        bool has_kept_child = false;
+        for (int p = 1; p < cnt; ++p) {
+          if (keep[p] && int(h_pool_parent_[p]) == u) { has_kept_child = true; break; }
+        }
+        if (!has_kept_child) { keep[u] = 0; ++dropped; --n_kept; }
+      }
+    }
+  }
+
+  out_tree = TreeSpec{};
+  int8_t remap[kBeamPoolCap];
+  std::memset(remap, -1, sizeof(remap));
+  for (int p = 0; p < cnt && out_tree.M < kMaxTree; ++p) {
+    if (!keep[p]) continue;
+    const int nid = out_tree.M++;
+    remap[p] = int8_t(nid);
+    out_tree.tok[nid] = h_pool_tok_[p];
+    const int8_t par = (p == 0) ? -1 : remap[int(h_pool_parent_[p])];
+    out_tree.p1[nid] = par;
+    out_tree.p2[nid] = (par >= 0) ? out_tree.p1[par] : -1;
+    out_tree.p3[nid] = (par >= 0 && out_tree.p1[par] >= 0) ? out_tree.p1[out_tree.p1[par]] : -1;
+    out_tree.depth[nid] = h_pool_depth_[p];
+    out_tree.max_depth = std::max(out_tree.max_depth, int(out_tree.depth[nid]));
+    uint32_t mask = (1u << nid);
+    if (par >= 0) mask |= out_tree.anc_mask[par];
+    out_tree.anc_mask[nid] = mask;
+  }
 }
 
 void EngineInk2::commit_mtp_context(int pos0, int m, const int32_t* d_pos_ptr, bool restore_conv) {
@@ -1609,6 +2234,8 @@ void EngineInk2::mtp_draft_step(int pos0, int Kd, const int32_t* d_pos_ptr, bool
   ink2::launch_rmsnorm(d_mtp_blk_x_, mtp_norm_.d_ptr, mtp_norm_.f32, d_mtp_blk_norm_, B, H, mtp_cfg_.rms_eps, stream_);
   if (d_draft_u_q8_) {
     ink2::launch_linear_q8_32(d_mtp_blk_norm_ + H, d_draft_u_q8_, d_draft_u_sc_, d_mtp_logits_, Kd, V, H, stream_);
+  } else if (d_screen_q8_) {
+    ink2::launch_screen_dot_multi(d_screen_q8_, d_screen_sc_, d_mtp_blk_norm_ + H, d_mtp_logits_, Kd, V, H, stream_);
   } else {
     ink2::launch_linear(cublas_, d_mtp_blk_norm_ + H, unembed_.d_ptr, unembed_.f32, d_x_bf16_, d_mtp_logits_,
                         Kd, V, H, false, stream_);
@@ -1648,6 +2275,15 @@ void EngineInk2::mtp_draft_step(int pos0, int Kd, const int32_t* d_pos_ptr, bool
 }
 
 void EngineInk2::mtp_verify_step(int pos0, int R, const int32_t* d_pos_ptr, bool greedy) {
+  if (greedy && use_screen_head_ && !use_q8_head_) {
+    forward_tokens(nullptr, R, pos0, false, true, true, false, d_pos_ptr);
+    ink2::launch_screen_argmax_bf16(
+        static_cast<const __nv_bfloat16*>(unembed_.d_ptr), d_screen_q8_, d_screen_sc_, d_screen_eps_, d_h_norm_, R,
+        cfg_.vocab, cfg_.hidden, suppress_active_ ? d_suppress_ : nullptr, d_screen_hnorm_, d_screen_max_lb_,
+        d_screen_dot_hat_, d_screen_cand_ids_, d_screen_cand_cnt_, kScreenMaxCand, cfg_.logit_softcap,
+        d_verify_samples_, stream_);
+    return;
+  }
   forward_tokens(nullptr, R, pos0, false, true, true, true, d_pos_ptr);
   if (greedy) {
     ink2::launch_argmax_rows(d_verify_logits_, R, cfg_.vocab, d_verify_samples_, d_blk_v_, d_blk_i_, stream_);
@@ -1791,26 +2427,28 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
   };
 
   int pend_p0 = 0, pend_m = 0;
-  auto run_commit = [&](int p0, int m) {
+  bool pend_restore_conv = true;
+  auto run_commit = [&](int p0, int m, bool restore_conv) {
     if (use_graph_ && m >= 1 && m <= kMtpBlock) {
+      const int r_idx = restore_conv ? 1 : 0;
       const int32_t cp = int32_t(p0);
       cuda_ok(cudaMemcpyAsync(d_commit_pos_, &cp, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload commit pos");
-      if (!commit_graph_exec_[m - 1]) {
+      if (!commit_graph_exec_[r_idx][m - 1]) {
         cuda_ok(cudaStreamSynchronize(stream_), "sync before commit graph");
         cuda_ok(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin commit graph");
-        commit_mtp_context(0, m, d_commit_pos_, true);
-        cuda_ok(cudaStreamEndCapture(stream_, &commit_graph_[m - 1]), "end commit graph");
-        cuda_ok(cudaGraphInstantiate(&commit_graph_exec_[m - 1], commit_graph_[m - 1], nullptr, nullptr, 0),
+        commit_mtp_context(0, m, d_commit_pos_, restore_conv);
+        cuda_ok(cudaStreamEndCapture(stream_, &commit_graph_[r_idx][m - 1]), "end commit graph");
+        cuda_ok(cudaGraphInstantiate(&commit_graph_exec_[r_idx][m - 1], commit_graph_[r_idx][m - 1], nullptr, nullptr, 0),
                 "instantiate commit graph");
       }
-      cuda_ok(cudaGraphLaunch(commit_graph_exec_[m - 1], stream_), "launch commit graph");
+      cuda_ok(cudaGraphLaunch(commit_graph_exec_[r_idx][m - 1], stream_), "launch commit graph");
     } else {
-      commit_mtp_context(p0, m, nullptr, true);
+      commit_mtp_context(p0, m, nullptr, restore_conv);
     }
   };
   auto flush_pending = [&]() {
     if (pend_m <= 0) return;
-    run_commit(pend_p0, pend_m);
+    run_commit(pend_p0, pend_m, pend_restore_conv);
     cuda_ok(cudaStreamSynchronize(stream_), "sync commit flush");
     pend_m = 0;
   };
@@ -1821,21 +2459,36 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     const int rem_gen = int(n_gen - st.produced);
     const int room = (max_ctx_ - 2) - pos_;
     if (room < 0) break;
+    const bool greedy = (temp_ <= 0.0f || top_k_ == 1);
+    const bool can_mtp = (mtp_enabled_ && rem_gen >= 2 && room >= 1);
 
-    const int Kd = (mtp_enabled_ && rem_gen >= 2 && room >= 1)
-                       ? std::min({k_cur, kMtpBlock - 1, rem_gen - 1, room})
-                       : 0;
-    if (Kd == 0) {
+    if (!can_mtp) {
       if (pend_m > 0) {
-        run_commit(pend_p0, pend_m);
+        run_commit(pend_p0, pend_m, pend_restore_conv);
         pend_m = 0;
       }
-      forward_tokens(&cur, 1, pos_, true, mtp_enabled_, false, false);
-      if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
-      ++pos_;
-      live_tokens_.push_back(cur);
-      ++passes;
-      const int32_t nxt = sample_logits(pos_);
+      const bool use_scr = greedy && use_screen_head_;
+      forward_tokens(&cur, 1, pos_, true, mtp_enabled_, false, false, nullptr, use_scr);
+      int32_t nxt = 0;
+      if (use_scr) {
+        cuda_ok(cudaMemcpyAsync(h_tok_, d_tok_out_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_), "copy tok");
+        cuda_ok(cudaStreamSynchronize(stream_), "sync screen argmax");
+        nxt = *h_tok_;
+        if (mtp_enabled_) {
+          pend_p0 = pos_;
+          pend_m = 1;
+          pend_restore_conv = false;
+        }
+        ++pos_;
+        live_tokens_.push_back(cur);
+        ++passes;
+      } else {
+        if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
+        ++pos_;
+        live_tokens_.push_back(cur);
+        ++passes;
+        nxt = sample_logits(pos_);
+      }
       last_tok_ = nxt;
       __atomic_store_n(&out_ids[1 + st.produced], nxt, __ATOMIC_RELEASE);
       ++st.produced;
@@ -1848,13 +2501,138 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     }
 
     if (pend_m > 0) {
-      run_commit(pend_p0, pend_m);
+      run_commit(pend_p0, pend_m, pend_restore_conv);
       pend_m = 0;
     }
 
+    if (use_tree_ && greedy && tree_max_ >= 3 && room >= 2 && rem_gen >= 3) {
+      TreeSpec tr;
+      const int depth_cap = std::min(room, rem_gen - 1);
+      const int max_nodes = std::min(tree_max_, room + 1);
+      draft_beam_tree(cur, pos_, max_nodes, depth_cap, tr);
+      if (tr.M >= 3) {
+        static constexpr int kBuckets[kNumTreeBuckets] = {3, 4, 5, 6, 8, 10, 12};
+        int bidx = -1;
+        for (int b = 0; b < kNumTreeBuckets; ++b) {
+          if (kBuckets[b] == tr.M) {
+            bidx = b;
+            break;
+          }
+        }
+        if (bidx >= 0) {
+          cuda_ok(cudaMemcpyAsync(d_tokens_, tr.tok, size_t(tr.M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream_),
+                  "upload tree toks");
+          cuda_ok(cudaMemcpyAsync(d_tree_p1_, tr.p1, size_t(tr.M) * sizeof(int8_t), cudaMemcpyHostToDevice, stream_),
+                  "upload tree p1");
+          cuda_ok(cudaMemcpyAsync(d_tree_p2_, tr.p2, size_t(tr.M) * sizeof(int8_t), cudaMemcpyHostToDevice, stream_),
+                  "upload tree p2");
+          cuda_ok(cudaMemcpyAsync(d_tree_p3_, tr.p3, size_t(tr.M) * sizeof(int8_t), cudaMemcpyHostToDevice, stream_),
+                  "upload tree p3");
+          cuda_ok(cudaMemcpyAsync(d_tree_depth_, tr.depth, size_t(tr.M) * sizeof(uint8_t), cudaMemcpyHostToDevice,
+                                  stream_),
+                  "upload tree depth");
+          cuda_ok(cudaMemcpyAsync(d_tree_anc_mask_, tr.anc_mask, size_t(tr.M) * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice, stream_),
+                  "upload tree mask");
+
+          const int sup_idx = suppress_active_ ? 1 : 0;
+          if (use_graph_) {
+            const int32_t sp = int32_t(pos_);
+            cuda_ok(cudaMemcpyAsync(d_step_pos_, &sp, sizeof(int32_t), cudaMemcpyHostToDevice, stream_),
+                    "upload tree step pos");
+            if (!tree_verify_graph_exec_[bidx][sup_idx]) {
+              cuda_ok(cudaStreamSynchronize(stream_), "sync before tree verify graph");
+              cuda_ok(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin tree verify graph");
+              forward_tree_verify(tr.M, 0, d_step_pos_);
+              cuda_ok(cudaStreamEndCapture(stream_, &tree_verify_graph_[bidx][sup_idx]), "end tree verify graph");
+              cuda_ok(cudaGraphInstantiate(&tree_verify_graph_exec_[bidx][sup_idx], tree_verify_graph_[bidx][sup_idx],
+                                           nullptr, nullptr, 0),
+                      "instantiate tree verify graph");
+            }
+            cuda_ok(cudaGraphLaunch(tree_verify_graph_exec_[bidx][sup_idx], stream_), "launch tree verify graph");
+          } else {
+            forward_tree_verify(tr.M, pos_, nullptr);
+          }
+
+          cuda_ok(cudaMemcpyAsync(h_tree_next_, d_verify_samples_, size_t(tr.M) * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  "copy tree next");
+          cuda_ok(cudaStreamSynchronize(stream_), "sync tree verify");
+
+          int32_t acc_path[kMaxTree];
+          int32_t acc_toks[kMaxTree];
+          int node = 0;
+          int a = 0;
+          acc_path[0] = 0;
+          int32_t target = h_tree_next_[0];
+          while (true) {
+            acc_toks[a] = target;
+            if (is_eos(target)) break;
+            int match = -1;
+            for (int c = node + 1; c < tr.M; ++c) {
+              if (int(tr.p1[c]) == node && tr.tok[c] == target) {
+                match = c;
+                break;
+              }
+            }
+            if (match < 0) break;
+            ++a;
+            acc_path[a] = match;
+            node = match;
+            target = h_tree_next_[match];
+          }
+
+          const int m = a + 1;
+          const int step_p0 = pos_;
+          int commit_len = m;
+          int32_t next_cur = acc_toks[a];
+          live_tokens_.push_back(cur);
+          for (int j = 0; j < m; ++j) {
+            const int32_t tok = acc_toks[j];
+            __atomic_store_n(&out_ids[1 + st.produced], tok, __ATOMIC_RELEASE);
+            ++st.produced;
+            if (is_eos(tok)) {
+              st.eos = 1;
+              commit_len = j + 1;
+              next_cur = tok;
+              break;
+            }
+            if (j < a) live_tokens_.push_back(tok);
+          }
+
+          for (int j = 0; j < commit_len; ++j) h_pair_toks_[j] = acc_path[j];
+          cuda_ok(cudaMemcpyAsync(d_acc_path_, h_pair_toks_, size_t(commit_len) * sizeof(int32_t),
+                                  cudaMemcpyHostToDevice, stream_),
+                  "upload acc path");
+          const int KVD_m = cfg_.hkv * cfg_.head_dim;
+          ink2::launch_commit_sconv_all48(d_conv_base_, d_stage_sconv_, d_acc_path_, commit_len,
+                                         int(cfg_.schedule.size()), kMaxTree, KVD_m, cfg_.hidden, stream_);
+          ink2::launch_commit_kv_all48(d_kc_ptrs_, d_vc_ptrs_, d_kv_cap_, d_kv_is_swa_, d_stage_k_, d_stage_v_,
+                                       d_acc_path_, step_p0, commit_len, int(cfg_.schedule.size()), kMaxTree,
+                                       cfg_.hkv, cfg_.head_dim, stream_);
+          ink2::launch_compact_taps(d_tap_[0], d_tap_[1], d_tap_[2], d_h_norm_, d_tap_scratch_, d_acc_path_,
+                                    commit_len, cfg_.hidden, stream_);
+
+          st.drafted += (tr.M - 1);
+          st.accepted += a;
+          ++passes;
+          step_ctr += a + 1;
+
+          pend_p0 = step_p0;
+          pend_m = commit_len;
+          pend_restore_conv = false;
+          pos_ += commit_len;
+          last_tok_ = next_cur;
+          cur = next_cur;
+          if (st.eos) break;
+          continue;
+        }
+      }
+    }
+
+    const int Kd = std::min({k_cur, kMtpBlock - 1, rem_gen - 1, room});
     const int R = Kd + 1;
     const int V = cfg_.vocab;
-    const bool greedy = (temp_ <= 0.0f || top_k_ == 1);
     h_pair_toks_[0] = cur;
     cuda_ok(cudaMemcpyAsync(d_tokens_, &h_pair_toks_[0], sizeof(int32_t), cudaMemcpyHostToDevice, stream_),
             "upload anchor tok");
@@ -1915,17 +2693,18 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
       const int32_t tok = accepted_out[j];
       __atomic_store_n(&out_ids[1 + st.produced], tok, __ATOMIC_RELEASE);
       ++st.produced;
-      if (j < a) live_tokens_.push_back(tok);
       if (is_eos(tok)) {
         st.eos = 1;
         commit_len = j + 1;
         next_cur = tok;
         break;
       }
+      if (j < a) live_tokens_.push_back(tok);
     }
 
     pend_p0 = pos_;
     pend_m = commit_len;
+    pend_restore_conv = true;
     pos_ += commit_len;
     last_tok_ = next_cur;
     cur = next_cur;

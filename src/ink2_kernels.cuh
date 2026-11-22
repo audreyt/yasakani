@@ -167,4 +167,86 @@ void launch_mtp_fold_add_q8(const float* x, const int8_t* fold_q, const __half* 
 
 void launch_f32_to_bf16_buf(const float* src, __nv_bfloat16* dst, int n, cudaStream_t s);
 
+// Screened exact BF16 unembed & L2-resident DSpark W=4 Markov beam tree (MIT-inspired by Niko1221/Strata)
+void launch_build_unembed_screen_bf16(const __nv_bfloat16* W, int8_t* q8, float* sc, float* eps, int V, int H,
+                                      cudaStream_t s);
+
+void launch_screen_argmax_bf16(const __nv_bfloat16* W_bf16, const int8_t* q8, const float* sc, const float* eps,
+                               const float* h, int M, int V, int H, const uint8_t* suppress, float* d_hnorm,
+                               int* d_max_lb, float* d_dot_hat, int32_t* d_cand_ids, int32_t* d_cand_cnt,
+                               int max_cand, float softcap, int32_t* d_out_argmax, cudaStream_t s);
+
+void launch_screen_dot_multi(const int8_t* q8, const float* sc, const float* h, float* out_logits, int M, int V,
+                             int H, cudaStream_t s);
+
+void launch_dspark_screen_dp4a7(const int8_t* q8, const float* sc, const float* h7, int8_t* h_q8, float* h_sc,
+                                const uint8_t* suppress, float* base_logits, int V, int H, cudaStream_t s);
+
+void launch_dspark_top_cand(const float* base_logits, int V, int K_cand, int32_t* tmp_ids, float* tmp_vals,
+                            int32_t* cand_ids, float* cand_base, cudaStream_t s);
+
+void launch_dspark_beam_init(const int32_t* d_anchor_id, float* beam_state, int32_t* beam_prev_tok, float* beam_logp,
+                             int32_t* beam_node, int32_t* pool_tok, int8_t* pool_parent, uint8_t* pool_depth,
+                             float* pool_logp, int32_t* pool_cnt, cudaStream_t s);
+
+void launch_dspark_markov_prep_batch(const int32_t* prev_toks, const float* states, const float* hidden,
+                                     const float* rec_feat, const __nv_bfloat16* markov_w1, float* joint_out,
+                                     int nw, int R, int H, cudaStream_t s);
+
+void launch_dspark_markov_update_batch(const float* proj, const __nv_bfloat16* rp_b, const float* state_in,
+                                       float* state_next, float* lat_out, int nw, int R, cudaStream_t s);
+
+void launch_dspark_add_bias_h_batch(float* corr, const float* ho_bias, const float* hidden, int nw, int H,
+                                    cudaStream_t s);
+
+void launch_dspark_score_cand_dp4a_batch(const int8_t* q8, const float* sc, const float* corr,
+                                         const int32_t* cand_ids, const uint8_t* suppress, int K_cand, int nw,
+                                         float softcap, float* cand_scores, cudaStream_t s);
+
+void launch_dspark_beam_expand(const float* cand_scores, const int32_t* cand_ids, const float* state_next,
+                               int K_cand, int nw, int beam_w, int depth, float* state_out,
+                               int32_t* beam_prev_tok, float* beam_logp, int32_t* beam_node, int32_t* pool_tok,
+                               int8_t* pool_parent, uint8_t* pool_depth, float* pool_logp, int32_t* pool_cnt,
+                               cudaStream_t s);
+
+// Tree verify & 2-launch all-48-visit commit kernels
+void launch_sconv_static_tree(const float* x, const void* w, bool w_f32, const float* hist, float* out,
+                              float* stage_raw, int stage_stride, int stage_ch_off, const int8_t* p1,
+                              const int8_t* p2, const int8_t* p3, int M, int C, float scale, const float* res_add,
+                              cudaStream_t s);
+
+void launch_sconv_static_kv_tree(float* xk, const void* wk, bool wk_f32, const float* hk,
+                                 float* xv, const void* wv, bool wv_f32, const float* hv,
+                                 float* stage_raw, int stage_stride, const int8_t* p1, const int8_t* p2,
+                                 const int8_t* p3, int M, int C, float scale, cudaStream_t s);
+
+void launch_sconv_dynamic_tree(const float* x, const float* dyn, const void* static_w, bool sw_f32,
+                               const float* hist, float* out, float* stage_raw, int stage_stride,
+                               int stage_ch_off, const int8_t* p1, const int8_t* p2, const int8_t* p3, int M, int C,
+                               int n_heads, cudaStream_t s);
+
+void launch_qkvr_prep_tree(float* q, const float* k, const float* v, float* r,
+                           const void* q_scale, const void* r_scale, bool sc_f32,
+                           float* stage_k, float* stage_v, int M, int Hq, int Hkv, int D, int d_rel,
+                           int pos0, const int32_t* d_pos_ptr, const uint8_t* d_depth,
+                           float qk_clip, float r_clip, float v_eps, float log_floor, float log_alpha,
+                           bool is_swa, cudaStream_t s);
+
+void launch_attn_tree(const float* q, const float* kc, const float* vc, const float* stage_k, const float* stage_v,
+                      const float* rb, const float* sinks, const float* gate, float* part_m, float* part_l,
+                      float* part_o, float* out, int M, int pos0, const int32_t* d_pos_ptr, const uint8_t* d_depth,
+                      const uint32_t* d_anc_mask, int kv_cap, int Hq, int Hkv, int D, int rel_extent, bool is_swa,
+                      int swa, cudaStream_t s);
+
+void launch_commit_sconv_all48(float* d_conv_base, const float* d_stage_sconv, const int32_t* d_path, int n_acc,
+                               int nv, int tree_cap, int KVD, int H, cudaStream_t s);
+
+void launch_commit_kv_all48(float* const* d_kc_ptrs, float* const* d_vc_ptrs, const int32_t* d_kv_cap,
+                            const uint8_t* d_kv_is_swa, const float* d_stage_k, const float* d_stage_v,
+                            const int32_t* d_path, int p0, int n_acc, int nv, int tree_cap, int Hkv, int D,
+                            cudaStream_t s);
+
+void launch_compact_taps(float* t0, float* t1, float* t2, float* t3, float* scratch, const int32_t* d_path,
+                         int n_acc, int H, cudaStream_t s);
+
 }  // namespace yskn::ink2
