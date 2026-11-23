@@ -210,8 +210,17 @@ extern "C" int yskn_spec_generate(yskn_engine* e, const int32_t* prompt, int n_p
 extern "C" YSKN_API int yskn_cancel(yskn_engine* e) { e->cancel.store(1); return 0; }
 extern "C" YSKN_API int yskn_set_visual(yskn_engine* e, const uint16_t* features, const int32_t* slots, int n_image,
                                         const int32_t* positions, int n_prompt, int delta) {
-  YSKN_TRY(if (!e->q) throw std::runtime_error("visual: qwen3_5 engine only"); ms_gate(e);
-            e->q->set_visual(features, slots, n_image, positions, n_prompt, delta))
+  YSKN_TRY(if (!e) throw std::runtime_error("visual: null engine");
+           YSKN_INK2(e->ink->set_visual(features, slots, n_image, n_prompt))
+           if (e->q) { ms_gate(e); e->q->set_visual(features, slots, n_image, positions, n_prompt, delta); }
+           else throw std::runtime_error("visual: qwen3_5 or inkling2 engine only");)
+}
+extern "C" YSKN_API int yskn_ink2_encode_rgb(yskn_engine* e, const uint8_t* const* frames,
+                                             const int32_t* widths, const int32_t* heights, int n_frames,
+                                             uint16_t* out_bf16, int32_t* out_grids, int32_t* out_n_tokens) {
+  YSKN_TRY(if (!e) throw std::runtime_error("ink2_encode_rgb: null engine");
+           YSKN_INK2(e->ink->encode_rgb(frames, widths, heights, n_frames, out_bf16, out_grids, out_n_tokens))
+           throw std::runtime_error("ink2_encode_rgb: inkling2 engine only");)
 }
 extern "C" YSKN_API int yskn_set_suppress(yskn_engine* e, const int32_t* token_ids, int n_tokens) {
   YSKN_TRY(if (!e->q) throw std::runtime_error("suppress: qwen3_5 engine only"); ms_gate(e);

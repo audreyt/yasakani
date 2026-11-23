@@ -9,10 +9,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace yskn {
+
+class Ink2VisionEncoder;
 
 struct Ink2Config {
   int hidden = 2304;
@@ -42,6 +45,7 @@ struct Ink2Config {
   float logit_softcap = 30.0f;
   std::vector<bool> is_local;
   std::vector<int> schedule;  // length 48
+  int image_token_id = 200054;
 };
 
 struct Ink2Tensor {
@@ -158,6 +162,9 @@ class EngineInk2 {
   void logits(float* out);
   void set_opt(int key, int value);
   void set_suppress(const int32_t* token_ids, int n_tokens);
+  void set_visual(const uint16_t* features, const int32_t* slots, int n_image, int n_prompt);
+  void encode_rgb(const uint8_t* const* frames, const int32_t* widths, const int32_t* heights, int n_frames,
+                  uint16_t* out_bf16, int32_t* out_grids, int32_t* out_n_tokens);
   void generate(const int32_t* prompt, int n_prompt, int n_gen, int eos1, int eos2,
                 const std::atomic<int>* cancel, int32_t* out_ids, Ink2GenStats& st);
 
@@ -173,6 +180,8 @@ class EngineInk2 {
     uint32_t anc_mask[kMaxTree] = {};
   };
 
+  void reset_kv();
+  bool visual_prefix_matches(int prefix_len) const;
   void forward_tokens(const int32_t* ids, int T, int pos0, bool need_logits,
                       bool capture_taps = false, bool save_snaps = false, bool need_all_logits = false,
                       const int32_t* d_pos_ptr = nullptr, bool greedy_argmax_only = false);
@@ -352,6 +361,19 @@ class EngineInk2 {
   cudaGraphExec_t beam_draft_graph_exec_[2] = {};
   cudaGraph_t tree_verify_graph_[kNumTreeBuckets][2] = {};
   cudaGraphExec_t tree_verify_graph_exec_[kNumTreeBuckets][2] = {};
+
+  // Native vision encoder & vis_sig injection state
+  std::unique_ptr<Ink2VisionEncoder> vision_;
+  bool vis_active_ = false;
+  int vis_n_image_ = 0;
+  int vis_n_prompt_ = 0;
+  int vis_cap_ = 0;
+  __nv_bfloat16* d_vis_feats_ = nullptr;
+  int vis_map_cap_ = 0;
+  int32_t* d_vis_map_ = nullptr;
+  std::vector<int32_t> vis_map_;
+  std::vector<uint64_t> active_vis_hash_;
+  std::vector<uint64_t> live_vis_hash_;
 };
 
 }  // namespace yskn

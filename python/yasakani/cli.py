@@ -222,6 +222,45 @@ def _vision(args):
     return vision
 
 
+def _validate_ink2_vision_args(args) -> None:
+    if any(getattr(args, k, None) for k in ("mmproj", "llama_dir", "vision_model")):
+        raise YasakaniError("Inkling-2 uses its built-in native vision encoder and does not take --mmproj, --llama-dir or --vision-model")
+    from .vision import DEFAULT_IMAGE_TOKENS, LOCAL_FILES_HINT, error_text, validate_vision_limits
+    try:
+        validate_vision_limits(getattr(args, "vision_max_image_tokens", DEFAULT_IMAGE_TOKENS),
+                               getattr(args, "vision_max_request_image_tokens", None))
+    except ValueError as ex:
+        raise YasakaniError("image input: %s" % error_text(ex)) from ex
+    allow = getattr(args, "vision_allow_local_files", None)
+    if allow and not Path(os.path.abspath(os.fspath(allow))).is_dir():
+        raise YasakaniError("image input: %s: no such folder: %s" % (LOCAL_FILES_HINT, allow))
+    for img_path in (getattr(args, "image", None) or []):
+        p = Path(img_path)
+        if not p.is_file():
+            raise YasakaniError("image input: cannot read image file: %s" % img_path)
+
+
+def _inkling2_vision(args, pack, eng):
+    if not pack.has_vision or not eng.supports_ink2_vision:
+        return None
+    from .vision import DEFAULT_IMAGE_TOKENS, Ink2NativeVision, error_text
+    allow_local = getattr(args, "vision_allow_local_files", None) or False
+    if getattr(args, "image", None):
+        allow_local = True
+    try:
+        vision = Ink2NativeVision(
+            eng,
+            cache=getattr(args, "vision_cache", None),
+            allow_local_files=allow_local,
+            max_image_tokens=getattr(args, "vision_max_image_tokens", DEFAULT_IMAGE_TOKENS),
+            max_request_image_tokens=getattr(args, "vision_max_request_image_tokens", None),
+        )
+        vision.check()
+    except (ValueError, OSError, RuntimeError, ImportError) as ex:
+        raise YasakaniError("image input: %s" % error_text(ex)) from ex
+    return vision
+
+
 def _open_stack(args, *, warm: bool = True, parallel: int = 1, allow_suppress: bool = True, allow_yarn2: bool = True):
     """Model folder -> (pack, engine, formatter, runner).  The tokenizer is loaded first so a broken folder fails before the long load.
     ``parallel`` N >= 2 (serve --parallel N): the context is chosen for N requests at once (``gpu.plan_parallel``); afterwards
@@ -254,7 +293,11 @@ def _open_stack(args, *, warm: bool = True, parallel: int = 1, allow_suppress: b
         if suppress_paths:
             raise YasakaniError("--suppress-tokens and YASAKANI_SUPPRESS_TOKENS are for Qwen3.8 model folders only (not for Inkling-2)")
     fmt = ChatFormatter(pack.root)
-    vision = _vision(args)                       # wrong image input options fail here, before the long load
+    if pack.is_hf_inkling2:
+        _validate_ink2_vision_args(args)
+        vision = None
+    else:
+        vision = _vision(args)                   # wrong image input options fail here, before the long load
     suppress_ids = pack.load_suppress_tokens(
         suppress_paths,
         allow_special=bool(getattr(args, "allow_suppress_special", False)),
@@ -338,6 +381,8 @@ def _open_stack(args, *, warm: bool = True, parallel: int = 1, allow_suppress: b
         if kept:
             _say("note: kept %s from the environment (read only by an engine library built with the test exports)" % ", ".join(kept))
         eng.wide_recheck = bool(getattr(args, "wide_recheck", False))
+        if pack.is_hf_inkling2 and vision is None:
+            vision = _inkling2_vision(args, pack, eng)
         runner = ChatRunner(eng, fmt, seed0=args.seed0, vision=vision)
         if warm:
             runner.warmup(say=_say)
@@ -752,6 +797,10 @@ def cmd_chat(args) -> int:
         kw["reasoning_effort"] = args.effort
     base: List[dict] = [{"role": "system", "content": args.system}] if args.system else []
     messages = list(base)
+    pending_images = [str(Path(p).resolve()) for p in (getattr(args, "image", None) or [])]
+    if pending_images and runner.vision is None:
+        eng.close()
+        raise YasakaniError("image input is not enabled for this model")
     print("YASAKANI chat - type /help for commands, /exit to quit.")
     try:
         while True:
@@ -782,7 +831,12 @@ def cmd_chat(args) -> int:
                 else:
                     print(CHAT_HELP)
                 continue
-            messages.append({"role": "user", "content": line})
+            if pending_images:
+                content = [{"type": "image_url", "image_url": {"url": p}} for p in pending_images] + [{"type": "text", "text": line}]
+                pending_images = []
+                messages.append({"role": "user", "content": content})
+            else:
+                messages.append({"role": "user", "content": line})
             params = ChatParams(messages=[dict(m) for m in messages], max_tokens=args.max_tokens, temperature=args.temperature,
                                 top_p=args.top_p, top_k=args.top_k, seed=args.seed, loop_guard=not args.no_loop_guard,
                                 template_kwargs=dict(kw))
@@ -1235,6 +1289,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--effort", choices=("low", "medium", "xhigh"), help="how long the model thinks (default xhigh)")
     sp.add_argument("--hide-thinking", action="store_true", help="do not print the thinking")
     sp.add_argument("--no-loop-guard", action="store_true")
+    sp.add_argument("--image", action="append", default=[], metavar="PATH",
+                    help="attach an image file to the first message (may be repeated)")
+    sp.add_argument("--vision-cache", default=None, help="folder to keep image features in (default: none)")
+    sp.add_argument("--vision-max-image-tokens", type=int, default=1024, metavar="N",
+                    help="downsize every image to at most N image tokens, 64 to 4096 (default 1024)")
+    sp.add_argument("--vision-max-request-image-tokens", type=int, default=None, metavar="N",
+                    help="at most N image tokens in one request (default: 8 x the per-image limit)")
     sp.set_defaults(func=cmd_chat)
 
     sp = sub.add_parser("selfcheck", help="run a few fixed greedy prompts and compare the output with the reference file "

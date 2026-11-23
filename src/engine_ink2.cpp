@@ -3,6 +3,7 @@
 #include "engine_ink2.hpp"
 
 #include "ink2_kernels.cuh"
+#include "ink2_vision.hpp"
 #include "safetensors.hpp"
 
 #include <algorithm>
@@ -216,6 +217,8 @@ Ink2Config parse_ink2_config(const std::string& dir) {
   c.log_alpha = gf(t.at("log_scaling_alpha"), 0.1f);
   c.route_scale = gf(t.at("route_scale"), 8.0f);
   c.logit_softcap = gf(t.at("final_logit_softcapping"), 30.0f);
+  c.image_token_id = root.has("image_token_id") ? gi(root.at("image_token_id"), 200054)
+                                                : gi(t.at("image_token_id"), 200054);
 
   const stjson::Val& loop = t.at("loop_config");
   c.core_start = gi(loop.at("core_start"), 6);
@@ -1186,6 +1189,9 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     }
   }
 
+  if (Ink2VisionEncoder::has_vision_config(dir_)) {
+    vision_ = std::make_unique<Ink2VisionEncoder>(dir_, stream_, cublas_);
+  }
   if (const char* eg = std::getenv("YSKN_INK2_GRAPH")) use_graph_ = (std::strcmp(eg, "0") != 0);
   reset();
   } catch (...) {  // a refused or damaged folder: give back what was taken before the error
@@ -1258,6 +1264,13 @@ void EngineInk2::destroy_graphs() {
 void EngineInk2::free_all() noexcept {
   if (stream_) cudaStreamSynchronize(stream_);
   destroy_graphs();
+  vision_.reset();
+  if (d_vis_feats_) cudaFree(d_vis_feats_);
+  if (d_vis_map_) cudaFree(d_vis_map_);
+  d_vis_feats_ = nullptr;
+  d_vis_map_ = nullptr;
+  vis_cap_ = 0;
+  vis_map_cap_ = 0;
   if (h_logits_) cudaFreeHost(h_logits_);
   if (h_verify_logits_) cudaFreeHost(h_verify_logits_);
   if (h_tok_) cudaFreeHost(h_tok_);
@@ -1290,7 +1303,7 @@ void EngineInk2::free_all() noexcept {
 
 EngineInk2::~EngineInk2() { free_all(); }
 
-void EngineInk2::reset() {
+void EngineInk2::reset_kv() {
   cuda_ok(cudaMemsetAsync(d_conv_base_, 0, cfg_.schedule.size() * size_t(kVisitConvFloats) * sizeof(float), stream_),
           "memset conv");
   if (d_mtp_rec_feat_) cuda_ok(cudaMemsetAsync(d_mtp_rec_feat_, 0, size_t(cfg_.hidden) * sizeof(float), stream_), "memset rec_feat");
@@ -1299,6 +1312,16 @@ void EngineInk2::reset() {
   last_tok_ = -1;
   logits_valid_ = false;
   live_tokens_.clear();
+  live_vis_hash_.clear();
+}
+
+void EngineInk2::reset() {
+  reset_kv();
+  vis_active_ = false;
+  vis_n_image_ = 0;
+  vis_n_prompt_ = 0;
+  vis_map_.clear();
+  active_vis_hash_.clear();
 }
 
 void EngineInk2::set_opt(int key, int value) {
@@ -1311,6 +1334,106 @@ void EngineInk2::set_opt(int key, int value) {
     case 29: min_p_ = float(value) / 1000.0f; break;
     default: break;
   }
+}
+
+namespace {
+
+uint64_t ink2_vis_row_hash(const uint16_t* row, int H) {
+  uint64_t h = 1469598103934665603ULL;
+  const uint8_t* b = reinterpret_cast<const uint8_t*>(row);
+  const size_t n = size_t(H) * sizeof(uint16_t);
+  for (size_t i = 0; i + 8 <= n; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, b + i, 8);
+    h ^= w;
+    h *= 1099511628211ULL;
+  }
+  for (size_t i = n & ~size_t(7); i < n; ++i) {
+    h ^= b[i];
+    h *= 1099511628211ULL;
+  }
+  return h | 1ULL;
+}
+
+}  // namespace
+
+void EngineInk2::encode_rgb(const uint8_t* const* frames, const int32_t* widths, const int32_t* heights, int n_frames,
+                            uint16_t* out_bf16, int32_t* out_grids, int32_t* out_n_tokens) {
+  if (!vision_) throw std::runtime_error("encode_rgb: checkpoint has no vision encoder");
+  vision_->encode_rgb(frames, widths, heights, n_frames, out_bf16, out_grids, out_n_tokens);
+}
+
+bool EngineInk2::visual_prefix_matches(int prefix_len) const {
+  for (int p = 0; p < prefix_len; ++p) {
+    const uint64_t lh = (p < int(live_vis_hash_.size())) ? live_vis_hash_[size_t(p)] : 0ULL;
+    const uint64_t ah = (vis_active_ && p < int(active_vis_hash_.size())) ? active_vis_hash_[size_t(p)] : 0ULL;
+    if (lh != ah) return false;
+  }
+  return true;
+}
+
+void EngineInk2::set_visual(const uint16_t* features, const int32_t* slots, int n_image, int n_prompt) {
+  if (n_image < 0 || n_prompt < 0 || n_image > n_prompt || n_prompt >= max_ctx_) {
+    throw std::runtime_error("visual: invalid image token count or prompt length");
+  }
+  if (n_image == 0) {
+    vis_active_ = false;
+    vis_n_image_ = 0;
+    vis_n_prompt_ = 0;
+    vis_map_.clear();
+    active_vis_hash_.clear();
+    return;
+  }
+  if (!features || !slots || n_prompt <= 0) throw std::runtime_error("visual: missing input");
+
+  std::vector<int32_t> map(size_t(n_prompt + kPrefillChunk), -1);
+  std::vector<uint64_t> hashes(size_t(n_prompt), 0ULL);
+  const int H = cfg_.hidden;
+  for (int i = 0; i < n_image; ++i) {
+    const int32_t sl = slots[i];
+    if (sl < 0 || sl >= n_prompt || map[size_t(sl)] != -1) throw std::runtime_error("visual: invalid slot");
+    const uint16_t* row = features + size_t(i) * size_t(H);
+    for (int c = 0; c < H; ++c) {
+      if ((row[c] & 0x7F80u) == 0x7F80u) throw std::runtime_error("visual: non-finite bfloat16 feature");
+    }
+    map[size_t(sl)] = i;
+    hashes[size_t(sl)] = ink2_vis_row_hash(row, H);
+  }
+
+  if (n_image > vis_cap_) {
+    if (d_vis_feats_) {
+      cuda_ok(cudaStreamSynchronize(stream_), "sync before vis realloc");
+      cudaFree(d_vis_feats_);
+      d_vis_feats_ = nullptr;
+      vis_cap_ = 0;
+    }
+    cuda_ok(cudaMalloc(&d_vis_feats_, size_t(n_image) * size_t(H) * sizeof(__nv_bfloat16)), "cudaMalloc d_vis_feats");
+    vis_cap_ = n_image;
+  }
+  const int need_map = n_prompt + kPrefillChunk;
+  if (need_map > vis_map_cap_) {
+    if (d_vis_map_) {
+      cuda_ok(cudaStreamSynchronize(stream_), "sync before vis_map realloc");
+      cudaFree(d_vis_map_);
+      d_vis_map_ = nullptr;
+      vis_map_cap_ = 0;
+    }
+    cuda_ok(cudaMalloc(&d_vis_map_, size_t(need_map) * sizeof(int32_t)), "cudaMalloc d_vis_map");
+    vis_map_cap_ = need_map;
+  }
+  cuda_ok(cudaMemcpyAsync(d_vis_feats_, features, size_t(n_image) * size_t(H) * sizeof(__nv_bfloat16),
+                          cudaMemcpyHostToDevice, stream_),
+          "upload vis features");
+  cuda_ok(cudaMemcpyAsync(d_vis_map_, map.data(), size_t(need_map) * sizeof(int32_t),
+                          cudaMemcpyHostToDevice, stream_),
+          "upload vis map");
+  cuda_ok(cudaStreamSynchronize(stream_), "sync vis features");
+
+  vis_n_image_ = n_image;
+  vis_n_prompt_ = n_prompt;
+  vis_map_.swap(map);
+  active_vis_hash_.swap(hashes);
+  vis_active_ = true;
 }
 
 void EngineInk2::set_suppress(const int32_t* token_ids, int n_tokens) {
@@ -1354,9 +1477,22 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
             "upload tokens");
   }
 
+  bool has_vis_in_chunk = false;
+  if (vis_active_ && ids != nullptr && pos0 < vis_n_prompt_) {
+    const int lim = std::min(T, vis_n_prompt_ - pos0);
+    for (int t = 0; t < lim; ++t) {
+      if (vis_map_[size_t(pos0 + t)] >= 0) {
+        if (ids[t] != cfg_.image_token_id) throw std::runtime_error("visual: slot token does not match image_token_id");
+        has_vis_in_chunk = true;
+      }
+    }
+  }
+
   auto run_forward_body = [&](const int32_t* d_pos_ptr) {
     ink2::launch_embed_norm(d_tokens_, 0, static_cast<const __nv_bfloat16*>(embed_.d_ptr),
-                            static_cast<const __nv_bfloat16*>(embed_norm_.d_ptr), d_x_, T, H, cfg_.rms_eps, stream_);
+                            static_cast<const __nv_bfloat16*>(embed_norm_.d_ptr), d_x_, T, H, cfg_.rms_eps, stream_,
+                            has_vis_in_chunk ? d_vis_feats_ : nullptr,
+                            has_vis_in_chunk ? (d_vis_map_ + pos0) : nullptr, cfg_.image_token_id);
 
     const float* blocks_vec[6] = {};
     float* bslot_ptr[6] = {d_blocks_[0], d_blocks_[1], d_blocks_[2], d_blocks_[3], d_blocks_[4], d_blocks_[5]};
@@ -1712,7 +1848,7 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
   const int argmax_idx = use_scr_argmax ? 1 : 0;
   if (d_pos_ptr_arg != nullptr) {
     run_forward_body(d_pos_ptr_arg);
-  } else if (T == 1 && need_logits && !need_all_logits && !capture_taps && !save_snaps && use_graph_) {
+  } else if (T == 1 && !has_vis_in_chunk && need_logits && !need_all_logits && !capture_taps && !save_snaps && use_graph_) {
     const int sup_idx = suppress_active_ ? 1 : 0;
     const int32_t sp = int32_t(pos0);
     cuda_ok(cudaMemcpyAsync(d_step_pos_, &sp, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload step pos");
@@ -2380,6 +2516,7 @@ int32_t EngineInk2::sample_logits(int64_t step_pos) {
 int32_t EngineInk2::prefill(const int32_t* ids, int n) {
   if (!ids || n <= 0) throw std::runtime_error("prefill requires >= 1 token");
   if (pos_ + n > max_ctx_) throw std::runtime_error("prompt exceeds max_ctx");
+  const int p_start = pos_;
   int off = 0;
   while (off < n) {
     const int c = std::min(kPrefillChunk, n - off);
@@ -2390,6 +2527,10 @@ int32_t EngineInk2::prefill(const int32_t* ids, int n) {
     off += c;
   }
   live_tokens_.insert(live_tokens_.end(), ids, ids + n);
+  for (int i = 0; i < n; ++i) {
+    const int p = p_start + i;
+    live_vis_hash_.push_back((vis_active_ && p < int(active_vis_hash_.size())) ? active_vis_hash_[size_t(p)] : 0ULL);
+  }
   last_tok_ = sample_logits(pos_);
   return last_tok_;
 }
@@ -2402,6 +2543,7 @@ void EngineInk2::decode(int32_t* out, int steps) {
     if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
     ++pos_;
     live_tokens_.push_back(tok);
+    live_vis_hash_.push_back(0ULL);
     last_tok_ = sample_logits(pos_);
     if (out) out[i] = last_tok_;
   }
@@ -2421,16 +2563,25 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
 
   if (!prompt || n_prompt <= 0) throw std::runtime_error("empty prompt");
   if (n_prompt >= max_ctx_) throw std::runtime_error("prompt exceeds max_ctx");
+  if (vis_active_) {
+    if (vis_n_prompt_ != n_prompt) throw std::runtime_error("visual: prompt length mismatch");
+    for (int i = 0; i < n_prompt; ++i) {
+      if (vis_map_[size_t(i)] >= 0 && prompt[i] != cfg_.image_token_id) {
+        throw std::runtime_error("visual: prompt slot token mismatch");
+      }
+    }
+  }
 
   const auto is_eos = [&](int32_t t) { return (eos1 != 0x7fffffff && t == eos1) || (eos2 != 0x7fffffff && t == eos2); };
 
   const auto t0 = clk::now();
   int cached = 0;
   if (!live_tokens_.empty() && int(live_tokens_.size()) < n_prompt &&
-      std::equal(live_tokens_.begin(), live_tokens_.end(), prompt)) {
+      std::equal(live_tokens_.begin(), live_tokens_.end(), prompt) &&
+      visual_prefix_matches(int(live_tokens_.size()))) {
     cached = int(live_tokens_.size());
   } else if (!live_tokens_.empty() || pos_ != 0) {
-    reset();
+    reset_kv();
   }
   st.cached = cached;
 
@@ -2448,6 +2599,10 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     ++passes;
   }
   live_tokens_.insert(live_tokens_.end(), prompt + cached, prompt + cached + off);
+  for (int i = 0; i < off; ++i) {
+    const int p = cached + i;
+    live_vis_hash_.push_back((vis_active_ && p < int(active_vis_hash_.size())) ? active_vis_hash_[size_t(p)] : 0ULL);
+  }
 
   st.produced = 0;
   st.eos = 0;
@@ -2550,11 +2705,13 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
         }
         ++pos_;
         live_tokens_.push_back(cur);
+        live_vis_hash_.push_back(0ULL);
         ++passes;
       } else {
         if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
         ++pos_;
         live_tokens_.push_back(cur);
+        live_vis_hash_.push_back(0ULL);
         ++passes;
         nxt = sample_logits(pos_);
       }
@@ -2708,6 +2865,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
           int commit_len = m;
           int32_t next_cur = acc_toks[a];
           live_tokens_.push_back(cur);
+          live_vis_hash_.push_back(0ULL);
           for (int j = 0; j < m; ++j) {
             const int32_t tok = acc_toks[j];
             __atomic_store_n(&out_ids[1 + st.produced], tok, __ATOMIC_RELEASE);
@@ -2718,7 +2876,10 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
               next_cur = tok;
               break;
             }
-            if (j < a) live_tokens_.push_back(tok);
+            if (j < a) {
+              live_tokens_.push_back(tok);
+              live_vis_hash_.push_back(0ULL);
+            }
           }
 
           for (int j = 0; j < commit_len; ++j) h_pair_toks_[j] = acc_path[j];
@@ -2810,6 +2971,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     int commit_len = m;
     int32_t next_cur = accepted_out[a];
     live_tokens_.push_back(cur);
+    live_vis_hash_.push_back(0ULL);
     for (int j = 0; j < m; ++j) {
       const int32_t tok = accepted_out[j];
       __atomic_store_n(&out_ids[1 + st.produced], tok, __ATOMIC_RELEASE);
@@ -2820,7 +2982,10 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
         next_cur = tok;
         break;
       }
-      if (j < a) live_tokens_.push_back(tok);
+      if (j < a) {
+        live_tokens_.push_back(tok);
+        live_vis_hash_.push_back(0ULL);
+      }
     }
 
     pend_p0 = pos_;
