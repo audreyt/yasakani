@@ -195,7 +195,14 @@ extern "C" int yskn_spec_generate(yskn_engine* e, const int32_t* prompt, int n_p
         stats[4] = (double)st.accepted;
         stats[30] = (double)st.produced;
         stats[31] = (double)st.eos;
+        if (ns > 41) stats[41] = (double)st.snap_mode;
         if (ns > 42) stats[42] = (double)st.cached;
+        if (ns > 51) {
+          stats[48] = (double)st.cached;
+          stats[49] = (double)st.snap_slots;
+          stats[50] = (double)st.snap_saved;
+          stats[51] = st.snap_ms;
+        }
       }
     } else
 #endif
@@ -234,7 +241,16 @@ extern "C" YSKN_API int yskn_time_cycle(yskn_engine* e, const int32_t* ids, int 
 extern "C" YSKN_API int yskn_wide_state(yskn_engine* e, int32_t* out, int n, int* n_out) {
   YSKN_TRY(if (!e->q) throw std::runtime_error("wide_state: qwen3_5 engine only"); *n_out = e->q->wide_state(out, n)) }
 extern "C" YSKN_API int yskn_snap_info(yskn_engine* e, int32_t* out4, int32_t* ids, int max_ids) { YSKN_TRY(
-  if (!e->q) throw std::runtime_error("snap: qwen3_5 engine only");
+  YSKN_INK2_ONLY(if (e->ink) {
+    const auto& lv = e->ink->live_tokens();
+    out4[0] = e->ink->position();
+    out4[1] = e->ink->latest_snap_pos();
+    out4[2] = lv.empty() ? 0 : 1;
+    out4[3] = (int32_t)lv.size();
+    if (ids) for (int i = 0; i < (int)lv.size() && i < max_ids; ++i) ids[i] = lv[i];
+    return 0;
+  })
+  if (!e->q) throw std::runtime_error("snap: qwen3_5 or inkling2 engine only");
   const auto& lv = e->q->snap_live(); out4[0] = e->q->position(); out4[1] = e->q->snap_pos(); out4[2] = e->q->snap_live_ok() ? 1 : 0;
   out4[3] = (int32_t)lv.size(); if (ids) for (int i = 0; i < (int)lv.size() && i < max_ids; ++i) ids[i] = lv[i]) }
 extern "C" int yskn_lfrow_table(yskn_engine* e, const uint8_t* tab48) { YSKN_TRY(ms_gate(e); if (e->q) e->q->lfrow_table(tab48); else throw std::runtime_error("lfrow: 27B engine only")) }

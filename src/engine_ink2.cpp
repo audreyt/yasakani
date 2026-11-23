@@ -463,7 +463,6 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     check_mini_shape(cfg_, root.has("text_config") ? root.at("text_config") : root, dir_);
   }
   max_ctx_ = max_ctx > 0 ? max_ctx : 32768;
-  ring_rows_ = (cfg_.swa + kPrefillChunk + 15) / 16 * 16;
 
   int dev = 0;
   cuda_ok(cudaGetDevice(&dev), "cudaGetDevice");
@@ -795,6 +794,18 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     }
   }
   reader.close_all();
+
+  max_swa_ = mtp_enabled_ ? std::max(cfg_.swa, mtp_cfg_.swa) : cfg_.swa;
+  ring_rows_ = (max_swa_ + kPrefillChunk + 15) / 16 * 16;
+  ring_rows_ = (kv_elem_bytes() <= 2) ? 2048 : std::max(ring_rows_, 2048);
+  if (const char* er = std::getenv("YSKN_INK2_RING_ROWS")) {
+    const int req = std::atoi(er);
+    if (req > 0) {
+      const int min_ring = max_swa_ + 64;
+      ring_rows_ = (std::max(req, min_ring) + 15) / 16 * 16;
+    }
+  }
+  prefill_chunk_ = std::min(kPrefillChunk, ring_rows_ - max_swa_);
 
   // KV caches (FP32 default, BF16 opt-in via YSKN_INK2_KV=bf16) & contiguous short-conv history across 48 visits
   const size_t nv = cfg_.schedule.size();
@@ -1192,6 +1203,26 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   if (Ink2VisionEncoder::has_vision_config(dir_)) {
     vision_ = std::make_unique<Ink2VisionEncoder>(dir_, stream_, cublas_);
   }
+  {
+    std::vector<int> base_local_visits;
+    base_local_visits.reserve(cfg_.schedule.size());
+    for (size_t v = 0; v < cfg_.schedule.size(); ++v) {
+      if (cfg_.is_local[size_t(cfg_.schedule[v])]) base_local_visits.push_back(int(v));
+    }
+    std::vector<int> mtp_local_layers;
+    if (mtp_enabled_) {
+      for (int i = 0; i < mtp_cfg_.num_layers; ++i) {
+        if (mtp_cfg_.is_local[i]) mtp_local_layers.push_back(i);
+      }
+    }
+    const char* sd = std::getenv("YSKN_INK2_SNAP_DEBUG");
+    const bool snap_debug = (sd && std::strcmp(sd, "1") == 0);
+    prefix_cache_.init(cfg_.schedule.size() * size_t(kVisitConvFloats) * sizeof(float),
+                       size_t(cfg_.hidden) * sizeof(float), mtp_enabled_, cfg_.swa, mtp_cfg_.swa, max_swa_,
+                       ring_rows_, size_t(cfg_.hkv) * size_t(cfg_.head_dim) * kv_elem_bytes(),
+                       size_t(mtp_cfg_.hkv) * size_t(mtp_cfg_.head_dim) * kv_elem_bytes(),
+                       std::move(base_local_visits), std::move(mtp_local_layers), snap_debug);
+  }
   if (const char* eg = std::getenv("YSKN_INK2_GRAPH")) use_graph_ = (std::strcmp(eg, "0") != 0);
   reset();
   } catch (...) {  // a refused or damaged folder: give back what was taken before the error
@@ -1263,6 +1294,7 @@ void EngineInk2::destroy_graphs() {
 
 void EngineInk2::free_all() noexcept {
   if (stream_) cudaStreamSynchronize(stream_);
+  prefix_cache_.release(stream_);
   destroy_graphs();
   vision_.reset();
   if (d_vis_feats_) cudaFree(d_vis_feats_);
@@ -1309,6 +1341,7 @@ void EngineInk2::reset_kv() {
   if (d_mtp_rec_feat_) cuda_ok(cudaMemsetAsync(d_mtp_rec_feat_, 0, size_t(cfg_.hidden) * sizeof(float), stream_), "memset rec_feat");
   cuda_ok(cudaStreamSynchronize(stream_), "reset sync");
   pos_ = 0;
+  max_written_pos_ = 0;
   last_tok_ = -1;
   logits_valid_ = false;
   live_tokens_.clear();
@@ -1317,11 +1350,30 @@ void EngineInk2::reset_kv() {
 
 void EngineInk2::reset() {
   reset_kv();
+  prefix_cache_.clear(stream_);
   vis_active_ = false;
   vis_n_image_ = 0;
   vis_n_prompt_ = 0;
   vis_map_.clear();
   active_vis_hash_.clear();
+}
+
+void EngineInk2::prepare_swa_write(int write_end) {
+  const int new_max = std::max(max_written_pos_, write_end);
+  if (new_max > max_written_pos_) {
+    prefix_cache_.backup_before_write(new_max, d_kc_, d_vc_, d_mtp_kc_, d_mtp_vc_, stream_);
+    max_written_pos_ = new_max;
+  }
+}
+
+void EngineInk2::capture_snapshot(int pos, Ink2SnapKind kind, Ink2GenStats& st) {
+  using clk = std::chrono::steady_clock;
+  using ms = std::chrono::duration<double, std::milli>;
+  const auto t0 = clk::now();
+  const bool saved = prefix_cache_.capture(pos, kind, live_tokens_, live_vis_hash_, d_conv_base_, d_mtp_rec_feat_,
+                                           max_written_pos_, stream_);
+  st.snap_ms += ms(clk::now() - t0).count();
+  if (saved) ++st.snap_saved;
 }
 
 void EngineInk2::set_opt(int key, int value) {
@@ -2519,8 +2571,9 @@ int32_t EngineInk2::prefill(const int32_t* ids, int n) {
   const int p_start = pos_;
   int off = 0;
   while (off < n) {
-    const int c = std::min(kPrefillChunk, n - off);
+    const int c = std::min(prefill_chunk_, n - off);
     const bool last = (off + c == n);
+    prepare_swa_write(pos_ + c);
     forward_tokens(ids + off, c, pos_, last, mtp_enabled_, false, false);
     if (mtp_enabled_) commit_mtp_context(pos_, c, nullptr, false);
     pos_ += c;
@@ -2539,6 +2592,7 @@ void EngineInk2::decode(int32_t* out, int steps) {
   if (last_tok_ < 0) throw std::runtime_error("decode called before prefill");
   for (int i = 0; i < steps; ++i) {
     const int32_t tok = last_tok_;
+    prepare_swa_write(pos_ + 1);
     forward_tokens(&tok, 1, pos_, true, mtp_enabled_, false, false);
     if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
     ++pos_;
@@ -2575,13 +2629,35 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
   const auto is_eos = [&](int32_t t) { return (eos1 != 0x7fffffff && t == eos1) || (eos2 != 0x7fffffff && t == eos2); };
 
   const auto t0 = clk::now();
+  st.snap_mode = 0;
+  st.snap_slots = 0;
+  st.snap_saved = 0;
+  st.snap_ms = 0.0;
   int cached = 0;
-  if (!live_tokens_.empty() && int(live_tokens_.size()) < n_prompt &&
+  if (!live_tokens_.empty() && int(live_tokens_.size()) == pos_ && int(live_tokens_.size()) < n_prompt &&
       std::equal(live_tokens_.begin(), live_tokens_.end(), prompt) &&
       visual_prefix_matches(int(live_tokens_.size()))) {
     cached = int(live_tokens_.size());
-  } else if (!live_tokens_.empty() || pos_ != 0) {
-    reset_kv();
+    st.snap_mode = 1;
+    prefix_cache_.invalidate_after(cached);
+  } else {
+    const int slot = prefix_cache_.find_best_match(prompt, n_prompt, active_vis_hash_, vis_active_);
+    if (slot >= 0) {
+      const auto rs_t0 = clk::now();
+      prefix_cache_.restore(slot, d_conv_base_, d_mtp_rec_feat_, d_kc_, d_vc_, d_mtp_kc_, d_mtp_vc_,
+                            max_written_pos_, live_tokens_, live_vis_hash_, stream_);
+      st.snap_ms += ms(clk::now() - rs_t0).count();
+      pos_ = int(live_tokens_.size());
+      cached = pos_;
+      last_tok_ = -1;
+      logits_valid_ = false;
+      st.snap_mode = 2;
+    } else {
+      if (!live_tokens_.empty() || pos_ != 0) reset_kv();
+      prefix_cache_.invalidate_all();
+      cached = 0;
+      st.snap_mode = 0;
+    }
   }
   st.cached = cached;
 
@@ -2590,8 +2666,9 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
   int passes = 0;
   while (off < rem) {
     if (cancel && cancel->load(std::memory_order_relaxed)) break;
-    const int c = std::min(kPrefillChunk, rem - off);
+    const int c = std::min(prefill_chunk_, rem - off);
     const bool last = (off + c == rem);
+    prepare_swa_write(pos_ + c);
     forward_tokens(prompt + cached + off, c, pos_, last, mtp_enabled_, false, false);
     if (mtp_enabled_) commit_mtp_context(pos_, c, nullptr, false);
     pos_ += c;
@@ -2613,8 +2690,12 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     st.prefill_ms = ms(t1 - t0).count();
     st.gen_ms = 0.0;
     st.passes = passes;
+    st.snap_slots = prefix_cache_.valid_count();
     return;
   }
+
+  // Trigger 1: snapshot at end of prompt prefill before generating token 0 (thought-free Turn 2 boundary)
+  capture_snapshot(pos_, Ink2SnapKind::kPromptEnd, st);
 
   int32_t cur = sample_logits(pos_);
   last_tok_ = cur;
@@ -2626,6 +2707,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     st.eos = is_eos(cur) ? 1 : 0;
     st.gen_ms = 0.0;
     st.passes = passes;
+    st.snap_slots = prefix_cache_.valid_count();
     return;
   }
 
@@ -2677,6 +2759,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     pend_m = 0;
   };
 
+  bool captured_end_msg = false;
   int64_t step_ctr = pos_;
   while (st.produced < n_gen) {
     if (cancel && cancel->load(std::memory_order_relaxed)) break;
@@ -2691,6 +2774,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
         run_commit(pend_p0, pend_m, pend_restore_conv);
         pend_m = 0;
       }
+      prepare_swa_write(pos_ + 1);
       const bool use_scr = greedy && use_screen_head_;
       forward_tokens(&cur, 1, pos_, true, mtp_enabled_, false, false, nullptr, use_scr);
       int32_t nxt = 0;
@@ -2706,12 +2790,24 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
         ++pos_;
         live_tokens_.push_back(cur);
         live_vis_hash_.push_back(0ULL);
+        if (!captured_end_msg && cur == kInk2EndMessageId) {
+          if (pend_m > 0) {
+            run_commit(pend_p0, pend_m, pend_restore_conv);
+            pend_m = 0;
+          }
+          capture_snapshot(pos_, Ink2SnapKind::kEndMessage, st);
+          captured_end_msg = true;
+        }
         ++passes;
       } else {
         if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
         ++pos_;
         live_tokens_.push_back(cur);
         live_vis_hash_.push_back(0ULL);
+        if (!captured_end_msg && cur == kInk2EndMessageId) {
+          capture_snapshot(pos_, Ink2SnapKind::kEndMessage, st);
+          captured_end_msg = true;
+        }
         ++passes;
         nxt = sample_logits(pos_);
       }
@@ -2788,7 +2884,10 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
           }
         }
       }
-      if (tr.M < 2) draft_beam_tree(cur, pos_, max_nodes, depth_cap, tr);
+      if (tr.M < 2) {
+        prepare_swa_write(pos_ + mtp_cfg_.block);
+        draft_beam_tree(cur, pos_, max_nodes, depth_cap, tr);
+      }
       if (tr.M >= 2) {
         int bidx = -1;
         for (int b = 0; b < kNumTreeBuckets; ++b) {
@@ -2887,23 +2986,57 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
                                   cudaMemcpyHostToDevice, stream_),
                   "upload acc path");
           const int KVD_m = cfg_.hkv * cfg_.head_dim;
-          ink2::launch_commit_sconv_all48(d_conv_base_, d_stage_sconv_, d_acc_path_, commit_len,
-                                         int(cfg_.schedule.size()), kMaxTree, KVD_m, cfg_.hidden, stream_);
+          prepare_swa_write(step_p0 + commit_len);
           ink2::launch_commit_kv_all48(d_kc_ptrs_, d_vc_ptrs_, d_kv_cap_, d_kv_is_swa_, d_stage_k_, d_stage_v_,
                                        d_acc_path_, step_p0, commit_len, int(cfg_.schedule.size()), kMaxTree,
                                        cfg_.hkv, cfg_.head_dim, kv_bf16_, stream_);
           ink2::launch_compact_taps(d_tap_[0], d_tap_[1], d_tap_[2], d_h_norm_, d_tap_scratch_, d_acc_path_,
                                     commit_len, cfg_.hidden, stream_);
 
+          int end_msg_rel = -1;
+          if (!captured_end_msg) {
+            for (int j = 0; j < commit_len; ++j) {
+              if (live_tokens_[size_t(step_p0 + j)] == kInk2EndMessageId) {
+                end_msg_rel = j;
+                break;
+              }
+            }
+          }
+          if (end_msg_rel >= 0 && end_msg_rel < commit_len - 1) {
+            ink2::launch_commit_sconv_all48(d_conv_base_, d_stage_sconv_, d_acc_path_, end_msg_rel + 1,
+                                           int(cfg_.schedule.size()), kMaxTree, KVD_m, cfg_.hidden, stream_);
+            run_commit(step_p0, end_msg_rel + 1, false);
+            capture_snapshot(step_p0 + end_msg_rel + 1, Ink2SnapKind::kEndMessage, st);
+            captured_end_msg = true;
+            ink2::launch_commit_sconv_all48(d_conv_base_, d_stage_sconv_, d_acc_path_ + (end_msg_rel + 1),
+                                           commit_len - (end_msg_rel + 1),
+                                           int(cfg_.schedule.size()), kMaxTree, KVD_m, cfg_.hidden, stream_);
+            pend_p0 = step_p0;
+            pend_m = commit_len;
+            pend_restore_conv = false;
+          } else {
+            ink2::launch_commit_sconv_all48(d_conv_base_, d_stage_sconv_, d_acc_path_, commit_len,
+                                           int(cfg_.schedule.size()), kMaxTree, KVD_m, cfg_.hidden, stream_);
+            if (end_msg_rel == commit_len - 1) {
+              run_commit(step_p0, commit_len, false);
+              capture_snapshot(step_p0 + commit_len, Ink2SnapKind::kEndMessage, st);
+              captured_end_msg = true;
+              pend_p0 = 0;
+              pend_m = 0;
+              pend_restore_conv = false;
+            } else {
+              pend_p0 = step_p0;
+              pend_m = commit_len;
+              pend_restore_conv = false;
+            }
+          }
+
           st.drafted += (tr.M - 1);
           st.accepted += a;
           ++passes;
           step_ctr += a + 1;
 
-          pend_p0 = step_p0;
-          pend_m = commit_len;
-          pend_restore_conv = false;
-          pos_ += commit_len;
+          pos_ = step_p0 + commit_len;
           last_tok_ = next_cur;
           cur = next_cur;
           if (st.eos) break;
@@ -2915,6 +3048,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     const int Kd = std::min({k_cur, kMtpBlock - 1, rem_gen - 1, room});
     const int R = Kd + 1;
     const int V = cfg_.vocab;
+    prepare_swa_write(pos_ + std::max(R, mtp_cfg_.block));
     h_pair_toks_[0] = cur;
     cuda_ok(cudaMemcpyAsync(d_tokens_, &h_pair_toks_[0], sizeof(int32_t), cudaMemcpyHostToDevice, stream_),
             "upload anchor tok");
@@ -2968,6 +3102,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     step_ctr += a + 1;
 
     const int m = a + 1;
+    const int p_base = pos_;
     int commit_len = m;
     int32_t next_cur = accepted_out[a];
     live_tokens_.push_back(cur);
@@ -2988,10 +3123,34 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
       }
     }
 
-    pend_p0 = pos_;
-    pend_m = commit_len;
-    pend_restore_conv = true;
-    pos_ += commit_len;
+    int end_msg_rel = -1;
+    if (!captured_end_msg) {
+      for (int j = 0; j < commit_len; ++j) {
+        if (live_tokens_[size_t(p_base + j)] == kInk2EndMessageId) {
+          end_msg_rel = j;
+          break;
+        }
+      }
+    }
+    if (end_msg_rel >= 0) {
+      run_commit(p_base, end_msg_rel + 1, true);
+      capture_snapshot(p_base + end_msg_rel + 1, Ink2SnapKind::kEndMessage, st);
+      captured_end_msg = true;
+      if (end_msg_rel == commit_len - 1) {
+        pend_p0 = 0;
+        pend_m = 0;
+        pend_restore_conv = true;
+      } else {
+        pend_p0 = p_base;
+        pend_m = commit_len;
+        pend_restore_conv = true;
+      }
+    } else {
+      pend_p0 = p_base;
+      pend_m = commit_len;
+      pend_restore_conv = true;
+    }
+    pos_ = p_base + commit_len;
     last_tok_ = next_cur;
     cur = next_cur;
 
@@ -3001,6 +3160,12 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     k_cur = choose_k(ema_hits, ema_trials);
   }
   flush_pending();
+  // Trigger 2b: capture clean end of assistant turn (e.g. final <|end_message|> right before EOS)
+  if (!(cancel && cancel->load(std::memory_order_relaxed)) && pos_ > n_prompt &&
+      (st.eos == 1 || (!live_tokens_.empty() && live_tokens_.back() == kInk2EndMessageId))) {
+    capture_snapshot(pos_, Ink2SnapKind::kEndMessage, st);
+  }
+  st.snap_slots = prefix_cache_.valid_count();
   const auto t2 = clk::now();
   st.gen_ms = ms(t2 - t1).count();
   st.passes = passes;

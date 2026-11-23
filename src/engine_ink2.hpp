@@ -2,6 +2,8 @@
 // Copyright (c) 2026 the YASAKANI authors
 #pragma once
 
+#include "ink2_prefix_cache.hpp"
+
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -124,6 +126,10 @@ struct Ink2GenStats {
   int64_t accepted = 0;
   double prefill_ms = 0.0;
   double gen_ms = 0.0;
+  int snap_mode = 0;  // 0 fresh prefill, 1 live continuation, 2 restored snapshot
+  int snap_slots = 0;
+  int snap_saved = 0;
+  double snap_ms = 0.0;
 };
 
 // CPU speculative acceptance helper (greedy exact & unbiased sampled rejection with independent residual salt).
@@ -155,6 +161,9 @@ class EngineInk2 {
   int vocab() const { return cfg_.vocab; }
   int max_ctx() const { return max_ctx_; }
   int position() const { return pos_; }
+  int snap_count() const { return prefix_cache_.valid_count(); }
+  int latest_snap_pos() const { return prefix_cache_.latest_pos(); }
+  const std::vector<int32_t>& live_tokens() const { return live_tokens_; }
 
   void reset();
   int32_t prefill(const int32_t* ids, int n);
@@ -180,7 +189,10 @@ class EngineInk2 {
     uint32_t anc_mask[kMaxTree] = {};
   };
 
+  size_t kv_elem_bytes() const { return kv_bf16_ ? sizeof(__nv_bfloat16) : sizeof(float); }
   void reset_kv();
+  void prepare_swa_write(int write_end);
+  void capture_snapshot(int pos, Ink2SnapKind kind, Ink2GenStats& st);
   bool visual_prefix_matches(int prefix_len) const;
   void forward_tokens(const int32_t* ids, int T, int pos0, bool need_logits,
                       bool capture_taps = false, bool save_snaps = false, bool need_all_logits = false,
@@ -201,10 +213,14 @@ class EngineInk2 {
   int sm_count_ = 48;
   int max_ctx_ = 32768;
   int ring_rows_ = 0;
+  int max_swa_ = 1024;
+  int prefill_chunk_ = kPrefillChunk;
   int pos_ = 0;
+  int max_written_pos_ = 0;
   int32_t last_tok_ = -1;
   bool logits_valid_ = false;
   std::vector<int32_t> live_tokens_;
+  Ink2PrefixCache prefix_cache_;
 
   // Sampling options (matching Engine35 option keys)
   float temp_ = 0.0f;
