@@ -111,6 +111,38 @@ struct Ink2MtpLayer {
   int qkv_rows = 0;
 };
 
+struct Ink2DFlashConfig {
+  int hidden = 2304;
+  int num_layers = 5;
+  int hq = 32;
+  int hkv = 8;
+  int head_dim = 128;
+  int ffn = 6912;
+  int swa = 2048;
+  int block = 8;
+  int conv_group_size = 16;
+  int conv_kernel_size = 2;
+  int selector_rank = 256;
+  int selector_top_k = 16;
+  int32_t mask_token_id = 200056;
+  float rope_theta = 10000.0f;
+  float rms_eps = 1e-6f;
+  float logit_softcap = 30.0f;
+  bool after_correction = true;
+  int vocab_padded = 201024;
+  int taps[4] = {5, 23, 41, 48};
+};
+
+struct Ink2DFlashLayer {
+  Ink2Tensor in_norm, attn_conv_base, attn_conv_proj;
+  Ink2Tensor q_norm, k_norm, o_proj;
+  Ink2Tensor post_norm, mlp_conv_base, mlp_conv_proj;
+  Ink2Tensor down_proj;
+  const __nv_bfloat16* w_qkv = nullptr;
+  const __nv_bfloat16* w_kv_ctx = nullptr;
+  const __nv_bfloat16* w_gu = nullptr;
+};
+
 struct Ink2GenStats {
   int64_t produced = 0;
   int eos = 0;
@@ -128,9 +160,15 @@ int ink2_accept_tokens(int32_t* out_accepted_and_next, const int32_t* draft_toke
                        const float* verify_logits, const float* draft_logits, const int32_t* verify_argmax,
                        float temp, int top_k, float top_p, float min_p, uint64_t seed, int64_t step);
 
+int ink2_accept_tokens_sparse(int32_t* out_accepted_and_next, const int32_t* draft_tokens, int K, int V,
+                              const float* verify_logits, const int32_t* draft_cand_ids,
+                              const float* draft_cand_probs, int K_sel, const int32_t* verify_argmax,
+                              float temp, int top_k, float top_p, float min_p, uint64_t seed, int64_t step);
+
 class EngineInk2 {
  public:
   static constexpr int kPrefillChunk = 1024;
+  static constexpr int kDflashCtxChunk = 256;
   static constexpr int kMtpBlock = 8;
   static constexpr int kMaxTree = 12;
   static constexpr int kNumTreeBuckets = 8;  // {2, 3, 4, 5, 6, 8, 10, 12}
@@ -139,7 +177,7 @@ class EngineInk2 {
   static constexpr int kBeamPoolCap = 64;
   static constexpr int kScreenMaxCand = 8192;
 
-  EngineInk2(const std::string& path, int max_ctx, int flags);
+  EngineInk2(const std::string& path, int max_ctx, int device, int flags);
   ~EngineInk2();
 
   EngineInk2(const EngineInk2&) = delete;
@@ -160,6 +198,8 @@ class EngineInk2 {
   void set_suppress(const int32_t* token_ids, int n_tokens);
   void generate(const int32_t* prompt, int n_prompt, int n_gen, int eos1, int eos2,
                 const std::atomic<int>* cancel, int32_t* out_ids, Ink2GenStats& st);
+  void dflash_debug_lattice(const int32_t* prompt, int n_prompt, int32_t* out_cand_ids, float* out_unary,
+                            float* out_edges, int32_t* out_proposals);
 
  private:
   struct TreeSpec {
@@ -173,6 +213,7 @@ class EngineInk2 {
     uint32_t anc_mask[kMaxTree] = {};
   };
 
+  bool any_draft_enabled() const { return mtp_enabled_ || dflash_enabled_; }
   void forward_tokens(const int32_t* ids, int T, int pos0, bool need_logits,
                       bool capture_taps = false, bool save_snaps = false, bool need_all_logits = false,
                       const int32_t* d_pos_ptr = nullptr, bool greedy_argmax_only = false);
@@ -181,6 +222,9 @@ class EngineInk2 {
   void commit_mtp_context(int pos0, int m, const int32_t* d_pos_ptr, bool restore_conv);
   void mtp_draft_step(int pos0, int Kd, const int32_t* d_pos_ptr, bool greedy, int64_t step_pos);
   void mtp_verify_step(int pos0, int R, const int32_t* d_pos_ptr, bool greedy);
+  void commit_dflash_context(int pos0, int m, const int32_t* d_pos_ptr, bool restore_conv);
+  void dflash_draft_step(int pos0, int Kd, const int32_t* d_pos_ptr, bool greedy, int64_t step_pos,
+                         bool compute_edges = false);
   void destroy_graphs();
   int32_t sample_logits_row(const float* h_row, int64_t step_pos) const;
   int32_t sample_logits(int64_t step_pos);
@@ -336,6 +380,29 @@ class EngineInk2 {
   int32_t* d_kv_cap_ = nullptr;
   uint8_t* d_kv_is_swa_ = nullptr;
 
+  // DFlash2 external block-diffusion drafter
+  bool dflash_enabled_ = false;
+  bool dflash_q8_head_ = false;
+  int dflash_k_ = 7;
+  std::string dflash_dir_;
+  Ink2DFlashConfig df_cfg_;
+  Ink2Tensor df_fc_, df_hidden_norm_, df_norm_;
+  Ink2Tensor df_sel_hidden_proj_, df_pred_cb_, df_succ_cb_;
+  std::vector<Ink2DFlashLayer> df_layers_;
+  std::vector<void*> df_kc_, df_vc_;
+  float *df_cat_ = nullptr, *df_ctx_proj_ = nullptr, *df_ctx_h_ = nullptr;
+  float *df_ctx_k_ = nullptr, *df_ctx_v_ = nullptr;
+  int32_t* df_blk_toks_ = nullptr;
+  float *df_blk_x_ = nullptr, *df_blk_res_ = nullptr, *df_blk_norm_ = nullptr;
+  float *df_blk_dyn_ = nullptr, *df_blk_conv_ = nullptr;
+  float *df_blk_q_ = nullptr, *df_blk_k_ = nullptr, *df_blk_v_ = nullptr, *df_blk_att_ = nullptr;
+  float *df_blk_gate_ = nullptr, *df_blk_out_ = nullptr, *df_qkv_tmp_ = nullptr;
+  float *df_logits_ = nullptr, *df_sel_h_ = nullptr;
+  float *df_top_tmp_vals_ = nullptr, *df_cand_unary_ = nullptr, *df_edges_ = nullptr;
+  int32_t *df_top_tmp_ids_ = nullptr, *df_cand_ids_ = nullptr;
+  int32_t* h_df_cand_ids_ = nullptr;
+  float *h_df_cand_unary_ = nullptr, *h_df_edges_ = nullptr, *h_df_sparse_probs_ = nullptr;
+
   // CUDA Graphs:
   // - T=1 plain decode ([argmax_only][sup])
   // - linear MTP draft+verify ([K-1][sup])
@@ -352,6 +419,10 @@ class EngineInk2 {
   cudaGraphExec_t beam_draft_graph_exec_[2] = {};
   cudaGraph_t tree_verify_graph_[kNumTreeBuckets][2] = {};
   cudaGraphExec_t tree_verify_graph_exec_[kNumTreeBuckets][2] = {};
+  cudaGraph_t df_dv_graph_[7][2] = {};
+  cudaGraphExec_t df_dv_graph_exec_[7][2] = {};
+  cudaGraph_t df_commit_graph_[2][8] = {};
+  cudaGraphExec_t df_commit_graph_exec_[2][8] = {};
 };
 
 }  // namespace yskn

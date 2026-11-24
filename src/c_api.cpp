@@ -58,11 +58,11 @@ static void ms_gate(yskn_engine* e) { if (e->q) e->q->ms_gate(); }
 #if YSKN_WITH_INK2
 extern "C" yskn_engine* yskn_open(const char* path, int max_ctx, int device, int flags) {
   try {
-    yskn::select_gpu(device);
     yskn_engine* r = nullptr;
     if (yskn::EngineInk2::is_inkling2_dir(path)) {
-      r = new yskn_engine{nullptr, nullptr, new yskn::EngineInk2(path, max_ctx, flags)};
+      r = new yskn_engine{nullptr, nullptr, new yskn::EngineInk2(path, max_ctx, device, flags)};
     } else {
+      yskn::select_gpu(device);
       std::string arch;
       { yskn::Container c; c.open(path); arch = c.model.arch; }
       r = arch == "qwen3_5" ? new yskn_engine{nullptr, new yskn::Engine35(path, max_ctx, flags)}
@@ -373,5 +373,27 @@ extern "C" YSKN_API int yskn_ink2_accept(int32_t* out_accepted_and_next, const i
     g_err = ex.what();
     return -1;
   }
+}
+
+extern "C" YSKN_API int yskn_ink2_accept_sparse(int32_t* out_accepted_and_next, const int32_t* draft_tokens, int K, int V,
+                                                const float* verify_logits, const int32_t* draft_cand_ids,
+                                                const float* draft_cand_probs, int K_sel,
+                                                const int32_t* verify_argmax, float temp, int top_k, float top_p,
+                                                float min_p, uint64_t seed, int64_t step) {
+  try {
+    return yskn::ink2_accept_tokens_sparse(out_accepted_and_next, draft_tokens, K, V, verify_logits, draft_cand_ids,
+                                           draft_cand_probs, K_sel, verify_argmax, temp, top_k, top_p, min_p, seed,
+                                           step);
+  } catch (const std::exception& ex) {
+    g_err = ex.what();
+    return -1;
+  }
+}
+
+extern "C" YSKN_API int yskn_ink2_dflash_lattice(yskn_engine* e, const int32_t* prompt, int n_prompt,
+                                                 int32_t* out_cand_ids, float* out_unary, float* out_edges,
+                                                 int32_t* out_proposals) {
+  YSKN_TRY(if (!e || !e->ink) throw std::runtime_error("ink2_dflash_lattice: inkling2 engine only");
+           e->ink->dflash_debug_lattice(prompt, n_prompt, out_cand_ids, out_unary, out_edges, out_proposals))
 }
 #endif

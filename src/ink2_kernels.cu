@@ -6266,4 +6266,422 @@ void launch_compact_taps(float* t0, float* t1, float* t2, float* t3, float* scra
   k_compact_taps_scatter<<<dim3(n_acc, 4, 1), 256, 0, s>>>(t0, t1, t2, t3, scratch, n_acc, H);
 }
 
+namespace {
+
+__global__ void k_dflash_concat_taps(const float* __restrict__ t0, const float* __restrict__ t1,
+                                     const float* __restrict__ t2, const float* __restrict__ t3,
+                                     int row_off, float* __restrict__ out_cat, int H4) {
+  const int tap = blockIdx.x;
+  const int r = blockIdx.y;
+  const float* src = (tap == 0) ? t0 : ((tap == 1) ? t1 : ((tap == 2) ? t2 : t3));
+  const float4* s4 = reinterpret_cast<const float4*>(src + size_t(row_off + r) * size_t(H4 * 4));
+  float4* d4 = reinterpret_cast<float4*>(out_cat + (size_t(r) * 4 + size_t(tap)) * size_t(H4 * 4));
+  for (int i = threadIdx.x; i < H4; i += blockDim.x) {
+    d4[i] = s4[i];
+  }
+}
+
+__global__ void k_dflash_prep_tokens(const int32_t* __restrict__ d_anchor_tok, int32_t* __restrict__ d_blk_toks,
+                                     int B, int32_t mask_token_id) {
+  const int i = threadIdx.x;
+  if (i < B) d_blk_toks[i] = (i == 0) ? *d_anchor_tok : mask_token_id;
+}
+
+__global__ void k_dflash_dyn_conv(const float* __restrict__ in, const float* __restrict__ dyn,
+                                  const __nv_bfloat16* __restrict__ base_kernel,
+                                  const float* __restrict__ residual, float* __restrict__ out,
+                                  int B, int H, int group_size, int conv_groups, bool finish) {
+  const int elem = blockIdx.x * blockDim.x + threadIdx.x;
+  if (elem >= B * H) return;
+  const int row = elem / H;
+  const int c = elem % H;
+  const int g = c / group_size;
+  const int kind = finish ? 1 : 0;
+  const int dyn_stride = 4 * conv_groups;
+  const float* drow = dyn + size_t(row) * size_t(dyn_stride) + size_t(kind * 2 * conv_groups);
+  const __nv_bfloat16* brow0 = base_kernel + size_t(kind * 2 + 0) * size_t(H);
+  float val = in[elem] * (__bfloat162float(brow0[c]) + drow[0 * conv_groups + g]);
+  if (row > 0) {
+    const __nv_bfloat16* brow1 = base_kernel + size_t(kind * 2 + 1) * size_t(H);
+    val += in[(row - 1) * H + c] * (__bfloat162float(brow1[c]) + drow[1 * conv_groups + g]);
+  }
+  if (finish && residual) val += residual[elem];
+  out[elem] = val;
+}
+
+template <bool KV_BF16>
+__global__ void k_dflash_attn(const float* __restrict__ q, const void* __restrict__ kc, const void* __restrict__ vc,
+                              const float* __restrict__ k_blk, const float* __restrict__ v_blk,
+                              float* __restrict__ out, int B, int P, const int32_t* d_pos_ptr, int kv_cap,
+                              int Hq, int Hkv, int D, int swa, float scale) {
+  __shared__ float tgm[8], tgl[8], tgo[8][128];
+  const int h = blockIdx.x, b = blockIdx.y;
+  const int sg = threadIdx.x >> 5, lane = threadIdx.x & 31, nsg = blockDim.x >> 5;
+  const int hkv = h / (Hq / Hkv), d0 = lane * 4;
+  const size_t qoff = (size_t(b) * size_t(Hq) + size_t(h)) * size_t(D) + size_t(d0);
+  const float4 qv = *reinterpret_cast<const float4*>(q + qoff);
+  const int P_val = d_pos_ptr ? *d_pos_ptr : P;
+  const int q_pos = P_val + b;
+  const int k_start = (q_pos >= swa - 1) ? (q_pos - (swa - 1)) : 0;
+
+  float mw = -INFINITY, lw = 0.0f;
+  float4 ow = make_float4(0, 0, 0, 0);
+  for (int kp = k_start + sg; kp < P_val; kp += nsg) {
+    const int slot = kp % kv_cap;
+    const size_t koff = (size_t(slot) * size_t(Hkv) + size_t(hkv)) * size_t(D) + size_t(d0);
+    const float4 kv = kv_load4<KV_BF16>(kc, koff);
+    const float sc = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w) * scale;
+    const float4 vv = kv_load4<KV_BF16>(vc, koff);
+    if (lw == 0.0f) {
+      mw = sc; lw = 1.0f; ow = vv;
+    } else {
+      const float nm = fmaxf(mw, sc);
+      const float e1 = expf(mw - nm), e2 = expf(sc - nm);
+      ow = make_float4(ow.x * e1 + vv.x * e2, ow.y * e1 + vv.y * e2,
+                       ow.z * e1 + vv.z * e2, ow.w * e1 + vv.w * e2);
+      lw = lw * e1 + e2;
+      mw = nm;
+    }
+  }
+  for (int kb = sg; kb < B; kb += nsg) {
+    const size_t koff = (size_t(kb) * size_t(Hkv) + size_t(hkv)) * size_t(D) + size_t(d0);
+    const float4 kv = *reinterpret_cast<const float4*>(k_blk + koff);
+    const float sc = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w) * scale;
+    const float4 vv = *reinterpret_cast<const float4*>(v_blk + koff);
+    if (lw == 0.0f) {
+      mw = sc; lw = 1.0f; ow = vv;
+    } else {
+      const float nm = fmaxf(mw, sc);
+      const float e1 = expf(mw - nm), e2 = expf(sc - nm);
+      ow = make_float4(ow.x * e1 + vv.x * e2, ow.y * e1 + vv.y * e2,
+                       ow.z * e1 + vv.z * e2, ow.w * e1 + vv.w * e2);
+      lw = lw * e1 + e2;
+      mw = nm;
+    }
+  }
+  if (lane == 0) { tgm[sg] = mw; tgl[sg] = lw; }
+  *reinterpret_cast<float4*>(&tgo[sg][d0]) = ow;
+  __syncthreads();
+  if (sg == 0) {
+    float mm = -INFINITY, ll = 0.0f;
+    float4 oo = make_float4(0, 0, 0, 0);
+    for (int s = 0; s < nsg; ++s) {
+      const float l2 = tgl[s];
+      if (l2 == 0.0f) continue;
+      const float m2 = tgm[s];
+      const float4 o2 = *reinterpret_cast<const float4*>(&tgo[s][d0]);
+      if (ll == 0.0f) {
+        mm = m2; ll = l2; oo = o2;
+      } else {
+        const float nm = fmaxf(mm, m2);
+        const float e1 = expf(mm - nm), e2 = expf(m2 - nm);
+        oo = make_float4(oo.x * e1 + o2.x * e2, oo.y * e1 + o2.y * e2,
+                         oo.z * e1 + o2.z * e2, oo.w * e1 + o2.w * e2);
+        ll = ll * e1 + l2 * e2;
+        mm = nm;
+      }
+    }
+    const float inv = (ll > 0.0f) ? (1.0f / ll) : 0.0f;
+    const size_t ooff = (size_t(b) * size_t(Hq) + size_t(h)) * size_t(D) + size_t(d0);
+    *reinterpret_cast<float4*>(out + ooff) = make_float4(oo.x * inv, oo.y * inv, oo.z * inv, oo.w * inv);
+  }
+}
+
+__device__ __forceinline__ bool better_cand(float va, int32_t ia, float vb, int32_t ib) {
+  return (va > vb) || (va == vb && ia < ib);
+}
+
+__global__ void __launch_bounds__(256) k_dflash_top16_p1(
+    const float* __restrict__ logits, int V, float* __restrict__ tmp_vals, int32_t* __restrict__ tmp_ids) {
+  __shared__ float sv[8];
+  __shared__ int32_t si[8];
+  __shared__ int32_t win_id;
+
+  const int chunk = blockIdx.x;
+  const int row = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int stride = gridDim.x * 256;
+  const float* lrow = logits + size_t(row) * size_t(V);
+
+  float lv[4];
+  int32_t li[4];
+  #pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int idx = chunk * 256 + tid + j * stride;
+    if (idx < V) {
+      lv[j] = lrow[idx];
+      li[j] = idx;
+    } else {
+      lv[j] = -INFINITY;
+      li[j] = 0x7fffffff;
+    }
+  }
+
+  const size_t out_base = (size_t(row) * size_t(gridDim.x) + size_t(chunk)) * 16;
+  for (int k = 0; k < 16; ++k) {
+    float mv = lv[0];
+    int32_t mi = li[0];
+    #pragma unroll
+    for (int j = 1; j < 4; ++j) {
+      if (better_cand(lv[j], li[j], mv, mi)) {
+        mv = lv[j];
+        mi = li[j];
+      }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+      const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+      if (better_cand(ov, oi, mv, mi)) {
+        mv = ov;
+        mi = oi;
+      }
+    }
+    if (lane == 0) { sv[warp] = mv; si[warp] = mi; }
+    __syncthreads();
+    if (tid == 0) {
+      float bv = sv[0];
+      int32_t bi = si[0];
+      for (int w = 1; w < 8; ++w) {
+        if (better_cand(sv[w], si[w], bv, bi)) {
+          bv = sv[w];
+          bi = si[w];
+        }
+      }
+      tmp_vals[out_base + k] = bv;
+      tmp_ids[out_base + k] = bi;
+      win_id = bi;
+    }
+    __syncthreads();
+    const int32_t picked = win_id;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if (li[j] == picked) {
+        lv[j] = -INFINITY;
+        li[j] = 0x7fffffff;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void __launch_bounds__(256) k_dflash_top16_p2(
+    const float* __restrict__ tmp_vals, const int32_t* __restrict__ tmp_ids,
+    float* __restrict__ out_vals, int32_t* __restrict__ out_ids, int n_cand_per_row) {
+  __shared__ float sv[8];
+  __shared__ int32_t si[8];
+  __shared__ int32_t win_id;
+
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const size_t in_base = size_t(row) * size_t(n_cand_per_row);
+
+  float cv[16];
+  int32_t ci[16];
+  #pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const int idx = tid + j * 256;
+    if (idx < n_cand_per_row) {
+      cv[j] = tmp_vals[in_base + idx];
+      ci[j] = tmp_ids[in_base + idx];
+    } else {
+      cv[j] = -INFINITY;
+      ci[j] = 0x7fffffff;
+    }
+  }
+
+  const size_t out_base = size_t(row) * 16;
+  for (int k = 0; k < 16; ++k) {
+    float mv = cv[0];
+    int32_t mi = ci[0];
+    #pragma unroll
+    for (int j = 1; j < 16; ++j) {
+      if (better_cand(cv[j], ci[j], mv, mi)) {
+        mv = cv[j];
+        mi = ci[j];
+      }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+      const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+      if (better_cand(ov, oi, mv, mi)) {
+        mv = ov;
+        mi = oi;
+      }
+    }
+    if (lane == 0) { sv[warp] = mv; si[warp] = mi; }
+    __syncthreads();
+    if (tid == 0) {
+      float bv = sv[0];
+      int32_t bi = si[0];
+      for (int w = 1; w < 8; ++w) {
+        if (better_cand(sv[w], si[w], bv, bi)) {
+          bv = sv[w];
+          bi = si[w];
+        }
+      }
+      out_vals[out_base + k] = bv;
+      out_ids[out_base + k] = bi;
+      win_id = bi;
+    }
+    __syncthreads();
+    const int32_t picked = win_id;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      if (ci[j] == picked) {
+        cv[j] = -INFINITY;
+        ci[j] = 0x7fffffff;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void __launch_bounds__(256) k_dflash_edge_table(
+    const int32_t* __restrict__ d_anchor_tok, const int32_t* __restrict__ cand_ids,
+    const float* __restrict__ sel_h, const __nv_bfloat16* __restrict__ pred_cb,
+    const __nv_bfloat16* __restrict__ succ_cb, float* __restrict__ d_edges,
+    int K_sel, int R) {
+  __shared__ float s_ctx[256];
+  const int p = blockIdx.x;
+  const int pre_idx = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  if (p == 0 && pre_idx > 0) return;
+  const int32_t pred_tok = (p == 0) ? *d_anchor_tok : cand_ids[size_t(p - 1) * size_t(K_sel) + size_t(pre_idx)];
+  if (tid < R) {
+    s_ctx[tid] = __bfloat162float(pred_cb[size_t(pred_tok) * size_t(R) + size_t(tid)]) *
+                 sel_h[size_t(p) * size_t(R) + size_t(tid)];
+  }
+  __syncthreads();
+
+  for (int k = warp; k < K_sel; k += 8) {
+    const int32_t succ_tok = cand_ids[size_t(p) * size_t(K_sel) + size_t(k)];
+    float acc = 0.0f;
+    for (int d = lane; d < R; d += 32) {
+      acc += s_ctx[d] * __bfloat162float(succ_cb[size_t(succ_tok) * size_t(R) + size_t(d)]);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) {
+      d_edges[(size_t(p) * size_t(K_sel) + size_t(pre_idx)) * size_t(K_sel) + size_t(k)] = acc;
+    }
+  }
+}
+
+__global__ void __launch_bounds__(256) k_dflash_select_chain_greedy(
+    const int32_t* __restrict__ d_anchor_tok, const int32_t* __restrict__ cand_ids,
+    const float* __restrict__ cand_unary, const float* __restrict__ sel_h,
+    const __nv_bfloat16* __restrict__ pred_cb, const __nv_bfloat16* __restrict__ succ_cb,
+    int32_t* __restrict__ d_out_toks, int Kd, int K_sel, int R,
+    float softcap, bool after_correction) {
+  __shared__ float s_ctx[256];
+  __shared__ float s_scores[32];
+  __shared__ int32_t s_pred;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  if (tid == 0) s_pred = *d_anchor_tok;
+  __syncthreads();
+
+  for (int p = 0; p < Kd; ++p) {
+    const int32_t pred_tok = s_pred;
+    if (tid < R) {
+      s_ctx[tid] = __bfloat162float(pred_cb[size_t(pred_tok) * size_t(R) + size_t(tid)]) *
+                   sel_h[size_t(p) * size_t(R) + size_t(tid)];
+    }
+    __syncthreads();
+
+    for (int k = warp; k < K_sel; k += 8) {
+      const int32_t succ_tok = cand_ids[size_t(p) * size_t(K_sel) + size_t(k)];
+      float acc = 0.0f;
+      for (int d = lane; d < R; d += 32) {
+        acc += s_ctx[d] * __bfloat162float(succ_cb[size_t(succ_tok) * size_t(R) + size_t(d)]);
+      }
+      acc = warp_sum(acc);
+      if (lane == 0) {
+        const float raw = cand_unary[size_t(p) * size_t(K_sel) + size_t(k)] + acc;
+        s_scores[k] = (after_correction && softcap > 0.0f) ? (softcap * tanhf(raw / softcap)) : raw;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      int best_k = 0;
+      float best_v = s_scores[0];
+      for (int k = 1; k < K_sel; ++k) {
+        if (s_scores[k] > best_v) {
+          best_v = s_scores[k];
+          best_k = k;
+        }
+      }
+      const int32_t tok = cand_ids[size_t(p) * size_t(K_sel) + size_t(best_k)];
+      d_out_toks[1 + p] = tok;
+      s_pred = tok;
+    }
+    __syncthreads();
+  }
+}
+
+}  // namespace
+
+void launch_dflash_concat_taps(const float* t0, const float* t1, const float* t2, const float* t3,
+                               int row_off, float* out_cat, int m, int H, cudaStream_t s) {
+  k_dflash_concat_taps<<<dim3(4, m, 1), 256, 0, s>>>(t0, t1, t2, t3, row_off, out_cat, H >> 2);
+}
+
+void launch_dflash_prep_tokens(const int32_t* d_anchor_tok, int32_t* d_blk_toks,
+                               int B, int32_t mask_token_id, cudaStream_t s) {
+  k_dflash_prep_tokens<<<1, 32, 0, s>>>(d_anchor_tok, d_blk_toks, B, mask_token_id);
+}
+
+void launch_dflash_dyn_conv(const float* in, const float* dyn, const __nv_bfloat16* base_kernel,
+                            const float* residual, float* out, int B, int H, int group_size,
+                            bool finish, cudaStream_t s) {
+  const int total = B * H;
+  const int conv_groups = H / group_size;
+  k_dflash_dyn_conv<<<(total + 255) / 256, 256, 0, s>>>(in, dyn, base_kernel, residual, out, B, H, group_size,
+                                                        conv_groups, finish);
+}
+
+void launch_dflash_attn(const float* q, const void* kc, const void* vc, const float* k_blk, const float* v_blk,
+                        float* out, int B, int P, const int32_t* d_pos_ptr, int kv_cap, int Hq, int Hkv, int D,
+                        int swa, bool kv_bf16, cudaStream_t s) {
+  const float scale = 1.0f / std::sqrt(float(D));
+  if (kv_bf16) {
+    k_dflash_attn<true><<<dim3(Hq, B, 1), 256, 0, s>>>(q, kc, vc, k_blk, v_blk, out, B, P, d_pos_ptr, kv_cap,
+                                                       Hq, Hkv, D, swa, scale);
+  } else {
+    k_dflash_attn<false><<<dim3(Hq, B, 1), 256, 0, s>>>(q, kc, vc, k_blk, v_blk, out, B, P, d_pos_ptr, kv_cap,
+                                                        Hq, Hkv, D, swa, scale);
+  }
+}
+
+void launch_dflash_top16(const float* logits, int rows, int V, float* tmp_vals, int32_t* tmp_ids,
+                         float* out_vals, int32_t* out_ids, cudaStream_t s) {
+  constexpr int kChunks = 256;
+  k_dflash_top16_p1<<<dim3(kChunks, rows, 1), 256, 0, s>>>(logits, V, tmp_vals, tmp_ids);
+  k_dflash_top16_p2<<<rows, 256, 0, s>>>(tmp_vals, tmp_ids, out_vals, out_ids, kChunks * 16);
+}
+
+void launch_dflash_edge_table(const int32_t* d_anchor_tok, const int32_t* cand_ids, const float* sel_h,
+                              const __nv_bfloat16* pred_cb, const __nv_bfloat16* succ_cb,
+                              float* d_edges, int rows, int K_sel, int R, cudaStream_t s) {
+  k_dflash_edge_table<<<dim3(rows, K_sel, 1), 256, 0, s>>>(d_anchor_tok, cand_ids, sel_h, pred_cb, succ_cb,
+                                                           d_edges, K_sel, R);
+}
+
+void launch_dflash_select_chain_greedy(const int32_t* d_anchor_tok, const int32_t* cand_ids, const float* cand_unary,
+                                       const float* sel_h, const __nv_bfloat16* pred_cb, const __nv_bfloat16* succ_cb,
+                                       int32_t* d_out_toks, int Kd, int K_sel, int R,
+                                       float softcap, bool after_correction, cudaStream_t s) {
+  k_dflash_select_chain_greedy<<<1, 256, 0, s>>>(d_anchor_tok, cand_ids, cand_unary, sel_h, pred_cb, succ_cb,
+                                                 d_out_toks, Kd, K_sel, R, softcap, after_correction);
+}
+
 }  // namespace yskn::ink2

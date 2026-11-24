@@ -264,4 +264,31 @@ void launch_commit_kv_all48(void* const* d_kc_ptrs, void* const* d_vc_ptrs, cons
 void launch_compact_taps(float* t0, float* t1, float* t2, float* t3, float* scratch, const int32_t* d_path,
                          int n_acc, int H, cudaStream_t s);
 
+// DFlash2 parallel block-diffusion drafter kernels
+void launch_dflash_concat_taps(const float* t0, const float* t1, const float* t2, const float* t3,
+                               int row_off, float* out_cat, int m, int H, cudaStream_t s);
+
+void launch_dflash_prep_tokens(const int32_t* d_anchor_tok, int32_t* d_blk_toks,
+                               int B, int32_t mask_token_id, cudaStream_t s);
+
+void launch_dflash_dyn_conv(const float* in, const float* dyn, const __nv_bfloat16* base_kernel,
+                            const float* residual, float* out, int B, int H, int group_size,
+                            bool finish, cudaStream_t s);
+
+void launch_dflash_attn(const float* q, const void* kc, const void* vc, const float* k_blk, const float* v_blk,
+                        float* out, int B, int P, const int32_t* d_pos_ptr, int kv_cap, int Hq, int Hkv, int D,
+                        int swa, bool kv_bf16, cudaStream_t s);
+
+void launch_dflash_top16(const float* logits, int rows, int V, float* tmp_vals, int32_t* tmp_ids,
+                         float* out_vals, int32_t* out_ids, cudaStream_t s);
+
+void launch_dflash_edge_table(const int32_t* d_anchor_tok, const int32_t* cand_ids, const float* sel_h,
+                              const __nv_bfloat16* pred_cb, const __nv_bfloat16* succ_cb,
+                              float* d_edges, int rows, int K_sel, int R, cudaStream_t s);
+
+void launch_dflash_select_chain_greedy(const int32_t* d_anchor_tok, const int32_t* cand_ids, const float* cand_unary,
+                                       const float* sel_h, const __nv_bfloat16* pred_cb, const __nv_bfloat16* succ_cb,
+                                       int32_t* d_out_toks, int Kd, int K_sel, int R,
+                                       float softcap, bool after_correction, cudaStream_t s);
+
 }  // namespace yskn::ink2

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 the YASAKANI authors
 #include "engine_ink2.hpp"
 
+#include "gpu_caps.hpp"
 #include "ink2_kernels.cuh"
 #include "safetensors.hpp"
 
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <queue>
 #include <stdexcept>
 #include <vector>
@@ -321,6 +323,130 @@ void check_mtp_shape(const Ink2MtpConfig& mc, const std::string& dir) {
                              ": this Inkling-2 MTP drafter runs the shape of Inkling-2 Mini only; " + bad);
 }
 
+Ink2DFlashConfig parse_dflash_config(const std::string& dir) {
+  const stjson::Val root = stjson::parse(slurp_file(dir + "/config.json"));
+  if (!root.has("dflash_config") || root.at("dflash_config").kind != stjson::Val::Obj) {
+    throw std::runtime_error("config.json in " + dir + ": missing dflash_config object");
+  }
+  const stjson::Val& dc = root.at("dflash_config");
+  auto gi = [&](const stjson::Val& v, const char* key) {
+    if (v.kind != stjson::Val::Num || !std::isfinite(v.num) || std::trunc(v.num) != v.num ||
+        v.num < double(std::numeric_limits<int>::min()) || v.num > double(std::numeric_limits<int>::max())) {
+      throw std::runtime_error("config.json in " + dir + ": " + key + " must be an integer");
+    }
+    return int(v.num);
+  };
+  auto gf = [&](const stjson::Val& v, const char* key) {
+    if (v.kind != stjson::Val::Num || !std::isfinite(v.num) ||
+        std::abs(v.num) > double(std::numeric_limits<float>::max())) {
+      throw std::runtime_error("config.json in " + dir + ": " + key + " must be a finite number");
+    }
+    return float(v.num);
+  };
+
+  Ink2DFlashConfig out;
+  out.hidden = gi(root.at("hidden_size"), "hidden_size");
+  out.num_layers = gi(root.at("num_hidden_layers"), "num_hidden_layers");
+  out.hq = gi(root.at("num_attention_heads"), "num_attention_heads");
+  out.hkv = gi(root.at("num_key_value_heads"), "num_key_value_heads");
+  out.head_dim = gi(root.at("head_dim"), "head_dim");
+  out.ffn = gi(root.at("intermediate_size"), "intermediate_size");
+  out.swa = gi(root.at("sliding_window"), "sliding_window");
+  out.rms_eps = gf(root.at("rms_norm_eps"), "rms_norm_eps");
+  out.vocab_padded = gi(root.at("vocab_size"), "vocab_size");
+  const stjson::Val& rope = root.at("rope_parameters");
+  if (rope.kind == stjson::Val::Obj) {
+    if (rope.at("rope_type").kind != stjson::Val::Str || rope.at("rope_type").s != "default")
+      throw std::runtime_error("config.json in " + dir + ": rope_parameters.rope_type must be default");
+    out.rope_theta = gf(rope.at("rope_theta"), "rope_parameters.rope_theta");
+  } else {
+    if (root.has("rope_parameters") || root.has("rope_scaling"))
+      throw std::runtime_error("config.json in " + dir + ": unsupported rotary configuration");
+    out.rope_theta = gf(root.at("rope_theta"), "rope_theta");
+  }
+
+  out.block = gi(dc.at("block_size"), "dflash_config.block_size");
+  out.conv_group_size = gi(dc.at("conv_group_size"), "dflash_config.conv_group_size");
+  out.conv_kernel_size = gi(dc.at("conv_kernel_size"), "dflash_config.conv_kernel_size");
+  out.selector_rank = gi(dc.at("selector_rank"), "dflash_config.selector_rank");
+  out.selector_top_k = gi(dc.at("selector_top_k"), "dflash_config.selector_top_k");
+  out.mask_token_id = int32_t(gi(dc.at("mask_token_id"), "dflash_config.mask_token_id"));
+  out.logit_softcap = gf(dc.at("final_logit_softcapping"), "dflash_config.final_logit_softcapping");
+  const std::string& mode = dc.at("selector_softcap_mode").s;
+  if (mode == "after_correction") out.after_correction = true;
+  else if (mode == "before_correction") out.after_correction = false;
+  else throw std::runtime_error("config.json in " + dir + ": unsupported selector_softcap_mode " + mode);
+  if (!dc.has("target_layer_ids") || dc.at("target_layer_ids").kind != stjson::Val::Arr ||
+      dc.at("target_layer_ids").arr.size() != 4) {
+    throw std::runtime_error("config.json in " + dir + ": dflash_config.target_layer_ids must have 4 elements");
+  }
+  const stjson::Val& tl = dc.at("target_layer_ids");
+  for (int i = 0; i < 4; ++i) out.taps[i] = gi(tl.arr[size_t(i)], "dflash_config.target_layer_ids");
+  if (gi(root.at("num_target_layers"), "num_target_layers") != out.taps[3])
+    throw std::runtime_error("config.json in " + dir + ": num_target_layers must match the final target tap");
+
+  if (root.at("is_causal").kind != stjson::Val::Bool || root.at("is_causal").b) {
+    throw std::runtime_error("config.json in " + dir + ": DFlash2 requires is_causal=false");
+  }
+  if (root.at("use_sliding_window").kind != stjson::Val::Bool || !root.at("use_sliding_window").b) {
+    throw std::runtime_error("config.json in " + dir + ": DFlash2 requires use_sliding_window=true");
+  }
+  if (root.at("hidden_act").kind != stjson::Val::Str || root.at("hidden_act").s != "silu" ||
+      root.at("attention_bias").kind != stjson::Val::Bool || root.at("attention_bias").b)
+    throw std::runtime_error("config.json in " + dir + ": DFlash2 requires silu and attention_bias=false");
+  const stjson::Val& layers = root.at("layer_types");
+  if (layers.kind != stjson::Val::Arr || layers.arr.size() != size_t(out.num_layers))
+    throw std::runtime_error("config.json in " + dir + ": layer_types must describe every draft layer");
+  for (const auto& layer : layers.arr) {
+    if (layer.kind != stjson::Val::Str || layer.s != "sliding_attention")
+      throw std::runtime_error("config.json in " + dir + ": every DFlash2 layer must use sliding_attention");
+  }
+  if (out.rms_eps <= 0.0f || out.rope_theta <= 0.0f || out.logit_softcap < 0.0f)
+    throw std::runtime_error("config.json in " + dir + ": invalid RMS epsilon, rotary theta, or logit softcap");
+  return out;
+}
+
+void check_dflash_shape(const Ink2DFlashConfig& dc, const Ink2Config& tc, const std::string& dir) {
+  const Ink2DFlashConfig m;
+  std::string bad;
+  auto eq = [&](const char* key, int got, int want) {
+    if (got != want)
+      bad += std::string(bad.empty() ? "" : ", ") + key + " " + std::to_string(got) + " (needs " +
+             std::to_string(want) + ")";
+  };
+  eq("hidden_size", dc.hidden, tc.hidden);
+  eq("num_hidden_layers", dc.num_layers, m.num_layers);
+  eq("num_attention_heads", dc.hq, m.hq);
+  eq("num_key_value_heads", dc.hkv, m.hkv);
+  eq("head_dim", dc.head_dim, m.head_dim);
+  eq("intermediate_size", dc.ffn, m.ffn);
+  eq("sliding_window", dc.swa, m.swa);
+  eq("vocab_size", dc.vocab_padded, tc.vocab_padded);
+  eq("dflash_config.block_size", dc.block, m.block);
+  eq("dflash_config.conv_group_size", dc.conv_group_size, m.conv_group_size);
+  eq("dflash_config.conv_kernel_size", dc.conv_kernel_size, m.conv_kernel_size);
+  eq("dflash_config.selector_rank", dc.selector_rank, m.selector_rank);
+  eq("dflash_config.selector_top_k", dc.selector_top_k, m.selector_top_k);
+  if (bad.empty() && (dc.mask_token_id < 0 || dc.mask_token_id >= dc.vocab_padded)) {
+    bad = "dflash_config.mask_token_id out of range";
+  }
+  if (bad.empty()) {
+    const int n_visits = int(tc.schedule.size());
+    for (int i = 0; i < 4; ++i) {
+      if (dc.taps[i] < 0 || dc.taps[i] > n_visits || (i > 0 && dc.taps[i] <= dc.taps[i - 1])) {
+        bad = "dflash_config.target_layer_ids must be strictly ascending in [0.." + std::to_string(n_visits) + "]";
+        break;
+      }
+    }
+    if (bad.empty() && dc.taps[3] != n_visits) {
+      bad = "dflash_config.target_layer_ids[3] must equal final norm visit " + std::to_string(n_visits);
+    }
+  }
+  if (!bad.empty())
+    throw std::runtime_error("config.json in " + dir +
+                             ": this Inkling-2 DFlash2 drafter runs the Inkling-2-Mini DFlash2 shape only; " + bad);
+}
+
 // The dtype and shape the engine needs for one tensor (it sizes its buffers and kernels by the model shape, not the file).
 void expect_tensor(const StTensorInfo& t, const std::string& name, const char* dtype,
                    std::initializer_list<int64_t> shape) {
@@ -336,6 +462,40 @@ void expect_tensor(const StTensorInfo& t, const std::string& name, const char* d
   throw std::runtime_error("Inkling-2 weights: " + name + " is " + t.dtype + " " + dims(t.shape) + " (" +
                            std::to_string(t.nbytes) + " bytes); this engine needs " + dtype + " " +
                            dims(std::vector<int64_t>(shape)) + " (Inkling-2 Mini)");
+}
+
+void check_dflash_tensors(const SafetensorsReader& reader, const Ink2DFlashConfig& cfg) {
+  const int64_t h = cfg.hidden, qd = int64_t(cfg.hq) * cfg.head_dim, kvd = int64_t(cfg.hkv) * cfg.head_dim;
+  const int64_t f = cfg.ffn, r = cfg.selector_rank;
+  const int64_t g = (h / cfg.conv_group_size) * 2 * cfg.conv_kernel_size;
+  auto check = [&](const std::string& name, std::initializer_list<int64_t> shape) {
+    expect_tensor(reader.get(name), name, "BF16", shape);
+  };
+  check("fc.weight", {h, 4 * h});
+  check("hidden_norm.weight", {h});
+  check("norm.weight", {h});
+  check("candidate_selector.hidden_projection.weight", {r, h});
+  check("candidate_selector.predecessor_codebook", {cfg.vocab_padded, r});
+  check("candidate_selector.successor_codebook", {cfg.vocab_padded, r});
+
+  for (int i = 0; i < cfg.num_layers; ++i) {
+    const std::string lp = "layers." + std::to_string(i) + ".";
+    check(lp + "input_layernorm.weight", {h});
+    check(lp + "attention_conv.base_kernel", {2, cfg.conv_kernel_size, h});
+    check(lp + "attention_conv.kernel_projection.weight", {g, h});
+    check(lp + "self_attn.q_norm.weight", {cfg.head_dim});
+    check(lp + "self_attn.k_norm.weight", {cfg.head_dim});
+    check(lp + "self_attn.o_proj.weight", {h, qd});
+    check(lp + "post_attention_layernorm.weight", {h});
+    check(lp + "mlp_conv.base_kernel", {2, cfg.conv_kernel_size, h});
+    check(lp + "mlp_conv.kernel_projection.weight", {g, h});
+    check(lp + "mlp.down_proj.weight", {h, f});
+    check(lp + "self_attn.q_proj.weight", {qd, h});
+    check(lp + "self_attn.k_proj.weight", {kvd, h});
+    check(lp + "self_attn.v_proj.weight", {kvd, h});
+    check(lp + "mlp.gate_proj.weight", {f, h});
+    check(lp + "mlp.up_proj.weight", {f, h});
+  }
 }
 
 struct DevGuard {
@@ -418,6 +578,74 @@ int ink2_accept_tokens(int32_t* out_accepted_and_next, const int32_t* draft_toke
   return K;
 }
 
+int ink2_accept_tokens_sparse(int32_t* out_accepted_and_next, const int32_t* draft_tokens, int K, int V,
+                              const float* verify_logits, const int32_t* draft_cand_ids,
+                              const float* draft_cand_probs, int K_sel, const int32_t* verify_argmax,
+                              float temp, int top_k, float top_p, float min_p, uint64_t seed, int64_t step) {
+  if (K <= 0) {
+    if (out_accepted_and_next) {
+      if (temp <= 0.0f || top_k == 1) out_accepted_and_next[0] = verify_argmax[0];
+      else out_accepted_and_next[0] = draw_from_dist(build_row_dist(verify_logits, V, temp, top_k, top_p, min_p), seed, step);
+    }
+    return 0;
+  }
+  if (temp <= 0.0f || top_k == 1) {
+    return ink2_accept_tokens(out_accepted_and_next, draft_tokens, K, V, verify_logits, nullptr, verify_argmax,
+                              temp, top_k, top_p, min_p, seed, step);
+  }
+  auto q_prob = [&](int a, int32_t tok) -> double {
+    // Search only the selector support (16), never the full target support inside the residual scan.
+    double s = 0.0;
+    const int32_t* ids = draft_cand_ids + size_t(a) * size_t(K_sel);
+    const float* ps = draft_cand_probs + size_t(a) * size_t(K_sel);
+    for (int j = 0; j < K_sel; ++j) {
+      if (ids[j] == tok) s += double(ps[j]);
+    }
+    return s;
+  };
+  int a = 0;
+  for (; a < K; ++a) {
+    const int32_t dt = draft_tokens[a];
+    const SparseRowDist p = build_row_dist(verify_logits + size_t(a) * size_t(V), V, temp, top_k, top_p, min_p);
+    const double pa = p.prob(dt);
+    const double qa = q_prob(a, dt);
+    const double u_acc = sample_uniform(seed ^ kSaltAccept, step + a);
+    if (qa > 0.0 && u_acc * qa < pa) {
+      out_accepted_and_next[a] = dt;
+      continue;
+    }
+    std::vector<std::pair<int32_t, double>> res;
+    res.reserve(p.items.size());
+    double rsum = 0.0;
+    for (const auto& kv : p.items) {
+      const double r = kv.second - q_prob(a, kv.first);
+      if (r > 0.0) {
+        res.emplace_back(kv.first, r);
+        rsum += r;
+      }
+    }
+    int32_t chosen = p.items.empty() ? 0 : p.items[0].first;
+    if (rsum > 0.0) {
+      const double target = sample_uniform(seed ^ kSaltResidual, step + a) * rsum;
+      double run = 0.0;
+      chosen = res.back().first;
+      for (const auto& kv : res) {
+        run += kv.second;
+        if (target < run) {
+          chosen = kv.first;
+          break;
+        }
+      }
+    }
+    out_accepted_and_next[a] = chosen;
+    return a;
+  }
+  const SparseRowDist p_bonus =
+      build_row_dist(verify_logits + size_t(K) * size_t(V), V, temp, top_k, top_p, min_p);
+  out_accepted_and_next[K] = draw_from_dist(p_bonus, seed, step + K);
+  return K;
+}
+
 std::string EngineInk2::resolve_dir(const std::string& path) {
   namespace fs = std::filesystem;
   std::error_code ec;
@@ -450,7 +678,7 @@ void* EngineInk2::alloc_gpu(size_t bytes) {
   return ptr;
 }
 
-EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
+EngineInk2::EngineInk2(const std::string& path, int max_ctx, int device, int /*flags*/) {
   try {
   dir_ = resolve_dir(path);
   if (!is_inkling2_dir(dir_)) throw std::runtime_error(path + " is not an Inkling-2 checkpoint");
@@ -461,7 +689,21 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   }
   max_ctx_ = max_ctx > 0 ? max_ctx : 32768;
   ring_rows_ = (cfg_.swa + kPrefillChunk + 15) / 16 * 16;
+  std::optional<SafetensorsReader> draft_reader;
+  const char* edf_dir = std::getenv("YSKN_INK2_DFLASH_DIR");
+  const char* edf_on = std::getenv("YSKN_INK2_DFLASH");
+  if (edf_dir && edf_dir[0] != '\0' && !(edf_on && std::strcmp(edf_on, "0") == 0)) {
+    dflash_dir_ = resolve_dir(edf_dir);
+    df_cfg_ = parse_dflash_config(dflash_dir_);
+    check_dflash_shape(df_cfg_, cfg_, dflash_dir_);
+    draft_reader.emplace();
+    draft_reader->open_file(dflash_dir_ + "/model.safetensors");
+    check_dflash_tensors(*draft_reader, df_cfg_);
+    dflash_enabled_ = true;
+    ring_rows_ = (std::max(cfg_.swa, df_cfg_.swa) + kPrefillChunk + 15) / 16 * 16;
+  }
 
+  select_gpu(device);
   int dev = 0;
   cuda_ok(cudaGetDevice(&dev), "cudaGetDevice");
   cuda_ok(cudaDeviceGetAttribute(&sm_count_, cudaDevAttrMultiProcessorCount, dev), "cudaDeviceGetAttribute");
@@ -527,6 +769,21 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   bool mtp_want = std::filesystem::exists(dir_ + "/mtp.safetensors");
   if (const char* em = std::getenv("YSKN_INK2_MTP")) {
     if (std::strcmp(em, "0") == 0) mtp_want = false;
+  }
+  if (dflash_enabled_) {
+    dflash_k_ = df_cfg_.block - 1;
+    if (const char* ek = std::getenv("YSKN_INK2_DFLASH_K")) {
+      char* end = nullptr;
+      const long k = std::strtol(ek, &end, 10);
+      if (end == ek || *end != '\0' || k < 1 || k >= df_cfg_.block)
+        throw std::runtime_error("YSKN_INK2_DFLASH_K must be an integer between 1 and 7");
+      dflash_k_ = int(k);
+    }
+    if (const char* eh = std::getenv("YSKN_INK2_DFLASH_HEAD")) {
+      if (std::strcmp(eh, "q8") == 0 || std::strcmp(eh, "Q8") == 0) dflash_q8_head_ = true;
+    }
+    if (use_q8_head_) dflash_q8_head_ = true;
+    mtp_want = false;
   }
   if (mtp_want) mtp_enabled_ = parse_mtp_config(dir_, mtp_cfg_);
   if (const char* mq8 = std::getenv("YSKN_INK2_MTP_Q8")) mtp_q8_ = (std::strcmp(mq8, "0") != 0);
@@ -827,7 +1084,7 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
   d_h_norm_ = static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float)));
   for (int i = 0; i < 6; ++i) d_blocks_[i] = static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float)));
   for (int i = 0; i < 4; ++i) d_pre_blocks_[i] = static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float)));
-  for (int i = 0; i < 3; ++i) d_tap_[i] = mtp_enabled_ ? static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float))) : nullptr;
+  for (int i = 0; i < 3; ++i) d_tap_[i] = any_draft_enabled() ? static_cast<float*>(alloc_gpu(T * size_t(H) * sizeof(float))) : nullptr;
   d_ar_out_ = static_cast<float*>(alloc_gpu(4 * T * size_t(H) * sizeof(float)));
   d_msg_out_ = static_cast<float*>(alloc_gpu(4 * T * size_t(H) * sizeof(float)));
   d_mg_nhm_ = static_cast<float*>(alloc_gpu(T * 2 * size_t(H) * sizeof(float)));
@@ -1186,6 +1443,124 @@ EngineInk2::EngineInk2(const std::string& path, int max_ctx, int /*flags*/) {
     }
   }
 
+  if (dflash_enabled_) {
+    auto& dreader = *draft_reader;
+    auto dupload = [&](const std::string& name) -> Ink2Tensor {
+      const StTensorInfo& info = dreader.get(name);
+      Ink2Tensor t;
+      t.rows = int(info.shape[0]);
+      size_t col_prod = 1;
+      for (size_t i = 1; i < info.shape.size(); ++i) col_prod *= size_t(info.shape[i]);
+      t.cols = int(col_prod);
+      t.bytes = info.nbytes;
+      t.d_ptr = alloc_gpu(info.nbytes);
+      dreader.upload_gpu(info, t.d_ptr, stream_);
+      return t;
+    };
+
+    const int64_t DH = df_cfg_.hidden;
+    const int64_t DQD = int64_t(df_cfg_.hq) * df_cfg_.head_dim;
+    const int64_t DKVD = int64_t(df_cfg_.hkv) * df_cfg_.head_dim;
+    const int64_t DF = df_cfg_.ffn;
+    const int64_t DR = df_cfg_.selector_rank;
+    const int64_t DG = (DH / df_cfg_.conv_group_size) * 2 * df_cfg_.conv_kernel_size;
+
+    df_fc_ = dupload("fc.weight");
+    df_hidden_norm_ = dupload("hidden_norm.weight");
+    df_norm_ = dupload("norm.weight");
+    df_sel_hidden_proj_ = dupload("candidate_selector.hidden_projection.weight");
+    df_pred_cb_ = dupload("candidate_selector.predecessor_codebook");
+    df_succ_cb_ = dupload("candidate_selector.successor_codebook");
+
+    df_layers_.resize(size_t(df_cfg_.num_layers));
+    for (int i = 0; i < df_cfg_.num_layers; ++i) {
+      Ink2DFlashLayer& L = df_layers_[size_t(i)];
+      const std::string lp = "layers." + std::to_string(i) + ".";
+      L.in_norm = dupload(lp + "input_layernorm.weight");
+      L.attn_conv_base = dupload(lp + "attention_conv.base_kernel");
+      L.attn_conv_proj = dupload(lp + "attention_conv.kernel_projection.weight");
+      L.q_norm = dupload(lp + "self_attn.q_norm.weight");
+      L.k_norm = dupload(lp + "self_attn.k_norm.weight");
+      L.o_proj = dupload(lp + "self_attn.o_proj.weight");
+      L.post_norm = dupload(lp + "post_attention_layernorm.weight");
+      L.mlp_conv_base = dupload(lp + "mlp_conv.base_kernel");
+      L.mlp_conv_proj = dupload(lp + "mlp_conv.kernel_projection.weight");
+      L.down_proj = dupload(lp + "mlp.down_proj.weight");
+
+      const StTensorInfo& iq = dreader.get(lp + "self_attn.q_proj.weight");
+      const StTensorInfo& ik = dreader.get(lp + "self_attn.k_proj.weight");
+      const StTensorInfo& iv = dreader.get(lp + "self_attn.v_proj.weight");
+      uint8_t* qkv_buf = static_cast<uint8_t*>(alloc_gpu(iq.nbytes + ik.nbytes + iv.nbytes));
+      dreader.upload_gpu(iq, qkv_buf, stream_);
+      dreader.upload_gpu(ik, qkv_buf + iq.nbytes, stream_);
+      dreader.upload_gpu(iv, qkv_buf + iq.nbytes + ik.nbytes, stream_);
+      L.w_qkv = reinterpret_cast<const __nv_bfloat16*>(qkv_buf);
+      L.w_kv_ctx = reinterpret_cast<const __nv_bfloat16*>(qkv_buf + iq.nbytes);
+
+      const StTensorInfo& ig = dreader.get(lp + "mlp.gate_proj.weight");
+      const StTensorInfo& iu = dreader.get(lp + "mlp.up_proj.weight");
+      std::vector<uint16_t> hg(size_t(DF * DH)), hu(size_t(DF * DH)), hgu(size_t(2 * DF * DH));
+      dreader.read_host(ig, hg.data());
+      dreader.read_host(iu, hu.data());
+      for (int64_t r = 0; r < DF; ++r) {
+        std::memcpy(hgu.data() + size_t(2 * r) * size_t(DH), hg.data() + size_t(r) * size_t(DH),
+                    size_t(DH) * sizeof(uint16_t));
+        std::memcpy(hgu.data() + size_t(2 * r + 1) * size_t(DH), hu.data() + size_t(r) * size_t(DH),
+                    size_t(DH) * sizeof(uint16_t));
+      }
+      void* dgu = alloc_gpu(hgu.size() * sizeof(uint16_t));
+      cuda_ok(cudaMemcpyAsync(dgu, hgu.data(), hgu.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, stream_),
+              "upload df gu");
+      L.w_gu = static_cast<const __nv_bfloat16*>(dgu);
+    }
+    cuda_ok(cudaStreamSynchronize(stream_), "sync dflash weights");
+    draft_reader.reset();
+
+    df_kc_.resize(size_t(df_cfg_.num_layers));
+    df_vc_.resize(size_t(df_cfg_.num_layers));
+    const size_t df_kv_row_elems = size_t(DKVD);
+    for (int i = 0; i < df_cfg_.num_layers; ++i) {
+      df_kc_[size_t(i)] = alloc_gpu(size_t(ring_rows_) * df_kv_row_elems * kv_eb);
+      df_vc_[size_t(i)] = alloc_gpu(size_t(ring_rows_) * df_kv_row_elems * kv_eb);
+    }
+    const size_t DC = size_t(kDflashCtxChunk);
+    const size_t DB = size_t(df_cfg_.block);
+    const size_t Props = size_t(df_cfg_.block - 1);
+    const size_t Ksel = size_t(df_cfg_.selector_top_k);
+    df_cat_ = static_cast<float*>(alloc_gpu(DC * 4 * size_t(DH) * sizeof(float)));
+    df_ctx_proj_ = static_cast<float*>(alloc_gpu(DC * size_t(DH) * sizeof(float)));
+    df_ctx_h_ = static_cast<float*>(alloc_gpu(DC * size_t(DH) * sizeof(float)));
+    df_ctx_k_ = static_cast<float*>(alloc_gpu(DC * size_t(DKVD) * sizeof(float)));
+    df_ctx_v_ = static_cast<float*>(alloc_gpu(DC * size_t(DKVD) * sizeof(float)));
+
+    df_blk_toks_ = static_cast<int32_t*>(alloc_gpu(DB * sizeof(int32_t)));
+    df_blk_x_ = static_cast<float*>(alloc_gpu(DB * size_t(DH) * sizeof(float)));
+    df_blk_res_ = static_cast<float*>(alloc_gpu(DB * size_t(DH) * sizeof(float)));
+    df_blk_norm_ = static_cast<float*>(alloc_gpu(DB * size_t(DH) * sizeof(float)));
+    df_blk_dyn_ = static_cast<float*>(alloc_gpu(DB * size_t(DG) * sizeof(float)));
+    df_blk_conv_ = static_cast<float*>(alloc_gpu(DB * size_t(DH) * sizeof(float)));
+    df_blk_q_ = static_cast<float*>(alloc_gpu(DB * size_t(DQD) * sizeof(float)));
+    df_blk_k_ = static_cast<float*>(alloc_gpu(DB * size_t(DKVD) * sizeof(float)));
+    df_blk_v_ = static_cast<float*>(alloc_gpu(DB * size_t(DKVD) * sizeof(float)));
+    df_blk_att_ = static_cast<float*>(alloc_gpu(DB * size_t(DQD) * sizeof(float)));
+    df_blk_gate_ = static_cast<float*>(alloc_gpu(DB * size_t(DF) * sizeof(float)));
+    df_blk_out_ = static_cast<float*>(alloc_gpu(DB * size_t(DH) * sizeof(float)));
+    df_qkv_tmp_ = static_cast<float*>(alloc_gpu(DB * size_t(DQD + 2 * DKVD) * sizeof(float)));
+
+    df_logits_ = static_cast<float*>(alloc_gpu(Props * size_t(V) * sizeof(float)));
+    df_sel_h_ = static_cast<float*>(alloc_gpu(Props * size_t(DR) * sizeof(float)));
+    df_top_tmp_vals_ = static_cast<float*>(alloc_gpu(Props * 256 * Ksel * sizeof(float)));
+    df_top_tmp_ids_ = static_cast<int32_t*>(alloc_gpu(Props * 256 * Ksel * sizeof(int32_t)));
+    df_cand_unary_ = static_cast<float*>(alloc_gpu(Props * Ksel * sizeof(float)));
+    df_cand_ids_ = static_cast<int32_t*>(alloc_gpu(Props * Ksel * sizeof(int32_t)));
+    df_edges_ = static_cast<float*>(alloc_gpu(Props * Ksel * Ksel * sizeof(float)));
+
+    cuda_ok(cudaMallocHost(&h_df_cand_ids_, Props * Ksel * sizeof(int32_t)), "cudaMallocHost df_cand_ids");
+    cuda_ok(cudaMallocHost(&h_df_cand_unary_, Props * Ksel * sizeof(float)), "cudaMallocHost df_cand_unary");
+    cuda_ok(cudaMallocHost(&h_df_edges_, Props * Ksel * Ksel * sizeof(float)), "cudaMallocHost df_edges");
+    cuda_ok(cudaMallocHost(&h_df_sparse_probs_, Props * Ksel * sizeof(float)), "cudaMallocHost df_sparse_probs");
+  }
+
   if (const char* eg = std::getenv("YSKN_INK2_GRAPH")) use_graph_ = (std::strcmp(eg, "0") != 0);
   reset();
   } catch (...) {  // a refused or damaged folder: give back what was taken before the error
@@ -1253,6 +1628,30 @@ void EngineInk2::destroy_graphs() {
       }
     }
   }
+  for (int k = 0; k < 7; ++k) {
+    for (int s = 0; s < 2; ++s) {
+      if (df_dv_graph_exec_[k][s]) {
+        cudaGraphExecDestroy(df_dv_graph_exec_[k][s]);
+        df_dv_graph_exec_[k][s] = nullptr;
+      }
+      if (df_dv_graph_[k][s]) {
+        cudaGraphDestroy(df_dv_graph_[k][s]);
+        df_dv_graph_[k][s] = nullptr;
+      }
+    }
+  }
+  for (int r = 0; r < 2; ++r) {
+    for (int m = 0; m < 8; ++m) {
+      if (df_commit_graph_exec_[r][m]) {
+        cudaGraphExecDestroy(df_commit_graph_exec_[r][m]);
+        df_commit_graph_exec_[r][m] = nullptr;
+      }
+      if (df_commit_graph_[r][m]) {
+        cudaGraphDestroy(df_commit_graph_[r][m]);
+        df_commit_graph_[r][m] = nullptr;
+      }
+    }
+  }
 }
 
 void EngineInk2::free_all() noexcept {
@@ -1269,6 +1668,10 @@ void EngineInk2::free_all() noexcept {
   if (h_pool_depth_) cudaFreeHost(h_pool_depth_);
   if (h_pool_logp_) cudaFreeHost(h_pool_logp_);
   if (h_pool_cnt_) cudaFreeHost(h_pool_cnt_);
+  if (h_df_cand_ids_) cudaFreeHost(h_df_cand_ids_);
+  if (h_df_cand_unary_) cudaFreeHost(h_df_cand_unary_);
+  if (h_df_edges_) cudaFreeHost(h_df_edges_);
+  if (h_df_sparse_probs_) cudaFreeHost(h_df_sparse_probs_);
   if (cublas_) cublasDestroy(cublas_);
   for (void* p : gpu_allocs_) cudaFree(p);
   if (stream_) cudaStreamDestroy(stream_);
@@ -1283,6 +1686,10 @@ void EngineInk2::free_all() noexcept {
   h_pool_depth_ = nullptr;
   h_pool_logp_ = nullptr;
   h_pool_cnt_ = nullptr;
+  h_df_cand_ids_ = nullptr;
+  h_df_cand_unary_ = nullptr;
+  h_df_edges_ = nullptr;
+  h_df_sparse_probs_ = nullptr;
   cublas_ = nullptr;
   gpu_allocs_.clear();
   stream_ = nullptr;
@@ -1416,9 +1823,10 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
         }
       }
 
-      if (capture_taps && mtp_enabled_) {
+      if (capture_taps && any_draft_enabled()) {
+        const int* taps = dflash_enabled_ ? df_cfg_.taps : mtp_cfg_.taps;
         for (int ti = 0; ti < 3; ++ti) {
-          if (int(v_idx) == mtp_cfg_.taps[ti]) {
+          if (int(v_idx) == taps[ti]) {
             cuda_ok(cudaMemcpyAsync(d_tap_[ti], cur_x, row_bytes, cudaMemcpyDeviceToDevice, stream_), "capture tap");
           }
         }
@@ -1667,7 +2075,7 @@ void EngineInk2::forward_tokens(const int32_t* ids, int T, int pos0, bool need_l
       cur_x = next_x;
     }
 
-    if (!need_logits && !need_all_logits && !(capture_taps && mtp_enabled_)) return;
+    if (!need_logits && !need_all_logits && !(capture_taps && any_draft_enabled())) return;
 
     {
       const float* st[6];
@@ -2359,6 +2767,191 @@ void EngineInk2::mtp_verify_step(int pos0, int R, const int32_t* d_pos_ptr, bool
   }
 }
 
+void EngineInk2::commit_dflash_context(int pos0, int m, const int32_t* d_pos_ptr, bool restore_conv) {
+  if (!dflash_enabled_ || m <= 0) return;
+  if (restore_conv) {
+    const size_t cbytes = cfg_.schedule.size() * size_t(kVisitConvFloats) * sizeof(float);
+    cuda_ok(cudaMemcpyAsync(d_conv_base_, d_verify_conv_ + size_t(m - 1) * cfg_.schedule.size() * size_t(kVisitConvFloats),
+                            cbytes, cudaMemcpyDeviceToDevice, stream_),
+            "restore dflash sconv");
+  }
+  const int H = df_cfg_.hidden;
+  const int KVD = df_cfg_.hkv * df_cfg_.head_dim;
+  for (int off = 0; off < m; off += kDflashCtxChunk) {
+    if (d_pos_ptr && off > 0) throw std::runtime_error("dflash commit graph chunk overflow");
+    const int c = std::min(kDflashCtxChunk, m - off);
+    const int cur_p0 = d_pos_ptr ? 0 : (pos0 + off);
+    ink2::launch_dflash_concat_taps(d_tap_[0], d_tap_[1], d_tap_[2], d_h_norm_, off, df_cat_, c, H, stream_);
+    ink2::launch_linear(cublas_, df_cat_, df_fc_.d_ptr, df_fc_.f32, d_x_bf16_, df_ctx_proj_, c, H, 4 * H, false, stream_);
+    ink2::launch_rmsnorm(df_ctx_proj_, df_hidden_norm_.d_ptr, df_hidden_norm_.f32, df_ctx_h_, c, H, df_cfg_.rms_eps, stream_);
+    for (int i = 0; i < df_cfg_.num_layers; ++i) {
+      const Ink2DFlashLayer& L = df_layers_[size_t(i)];
+      const ink2::MultiLinearSeg kv_segs[2] = {{df_ctx_k_, KVD}, {df_ctx_v_, KVD}};
+      ink2::launch_linear_multi(cublas_, df_ctx_h_, L.w_kv_ctx, d_x_bf16_, d_qkvrsg_tmp_, kv_segs, 2, c, H, stream_);
+      ink2::launch_mtp_qk_rope_cache(df_blk_q_, df_ctx_k_, df_ctx_v_,
+                                     static_cast<const __nv_bfloat16*>(L.q_norm.d_ptr),
+                                     static_cast<const __nv_bfloat16*>(L.k_norm.d_ptr),
+                                     df_kc_[size_t(i)], df_vc_[size_t(i)], c, df_cfg_.hq, df_cfg_.hkv, df_cfg_.head_dim,
+                                     cur_p0, d_pos_ptr, ring_rows_, true, false, df_cfg_.rms_eps, df_cfg_.rope_theta,
+                                     kv_bf16_, stream_);
+    }
+  }
+}
+
+void EngineInk2::dflash_draft_step(int pos0, int Kd, const int32_t* d_pos_ptr, bool greedy, int64_t step_pos,
+                                   bool compute_edges) {
+  const int B = df_cfg_.block;
+  const int H = df_cfg_.hidden;
+  const int QD = df_cfg_.hq * df_cfg_.head_dim;
+  const int KVD = df_cfg_.hkv * df_cfg_.head_dim;
+  const int DG = (H / df_cfg_.conv_group_size) * 2 * df_cfg_.conv_kernel_size;
+  const int V = cfg_.vocab;
+  const int R = df_cfg_.selector_rank;
+  const int Ksel = df_cfg_.selector_top_k;
+
+  ink2::launch_dflash_prep_tokens(d_tokens_, df_blk_toks_, B, df_cfg_.mask_token_id, stream_);
+  ink2::launch_embed_norm(df_blk_toks_, 0, static_cast<const __nv_bfloat16*>(embed_.d_ptr),
+                          static_cast<const __nv_bfloat16*>(embed_norm_.d_ptr), df_blk_x_, B, H, cfg_.rms_eps, stream_);
+
+  for (int i = 0; i < df_cfg_.num_layers; ++i) {
+    const Ink2DFlashLayer& L = df_layers_[size_t(i)];
+    ink2::launch_rmsnorm(df_blk_x_, L.in_norm.d_ptr, L.in_norm.f32, df_blk_norm_, B, H, df_cfg_.rms_eps, stream_);
+    ink2::launch_linear(cublas_, df_blk_norm_, L.attn_conv_proj.d_ptr, L.attn_conv_proj.f32, d_x_bf16_, df_blk_dyn_,
+                        B, DG, H, false, stream_);
+    ink2::launch_dflash_dyn_conv(df_blk_norm_, df_blk_dyn_, static_cast<const __nv_bfloat16*>(L.attn_conv_base.d_ptr),
+                                 nullptr, df_blk_conv_, B, H, df_cfg_.conv_group_size, false, stream_);
+    const ink2::MultiLinearSeg qkv_segs[3] = {{df_blk_q_, QD}, {df_blk_k_, KVD}, {df_blk_v_, KVD}};
+    ink2::launch_linear_multi(cublas_, df_blk_conv_, L.w_qkv, d_x_bf16_, df_qkv_tmp_, qkv_segs, 3, B, H, stream_);
+    ink2::launch_mtp_qk_rope_cache(df_blk_q_, df_blk_k_, df_blk_v_,
+                                   static_cast<const __nv_bfloat16*>(L.q_norm.d_ptr),
+                                   static_cast<const __nv_bfloat16*>(L.k_norm.d_ptr),
+                                   df_kc_[size_t(i)], df_vc_[size_t(i)], B, df_cfg_.hq, df_cfg_.hkv, df_cfg_.head_dim,
+                                   pos0, d_pos_ptr, ring_rows_, true, true, df_cfg_.rms_eps, df_cfg_.rope_theta,
+                                   kv_bf16_, stream_);
+    ink2::launch_dflash_attn(df_blk_q_, df_kc_[size_t(i)], df_vc_[size_t(i)], df_blk_k_, df_blk_v_, df_blk_att_,
+                             B, pos0, d_pos_ptr, ring_rows_, df_cfg_.hq, df_cfg_.hkv, df_cfg_.head_dim,
+                             df_cfg_.swa, kv_bf16_, stream_);
+    ink2::launch_linear(cublas_, df_blk_att_, L.o_proj.d_ptr, L.o_proj.f32, d_x_bf16_, df_blk_out_,
+                        B, H, QD, false, stream_);
+    ink2::launch_dflash_dyn_conv(df_blk_out_, df_blk_dyn_, static_cast<const __nv_bfloat16*>(L.attn_conv_base.d_ptr),
+                                 df_blk_x_, df_blk_res_, B, H, df_cfg_.conv_group_size, true, stream_);
+
+    ink2::launch_rmsnorm(df_blk_res_, L.post_norm.d_ptr, L.post_norm.f32, df_blk_norm_, B, H, df_cfg_.rms_eps, stream_);
+    ink2::launch_linear(cublas_, df_blk_norm_, L.mlp_conv_proj.d_ptr, L.mlp_conv_proj.f32, d_x_bf16_, df_blk_dyn_,
+                        B, DG, H, false, stream_);
+    ink2::launch_dflash_dyn_conv(df_blk_norm_, df_blk_dyn_, static_cast<const __nv_bfloat16*>(L.mlp_conv_base.d_ptr),
+                                 nullptr, df_blk_conv_, B, H, df_cfg_.conv_group_size, false, stream_);
+    ink2::launch_mtp_gate_up_swiglu(df_blk_conv_, L.w_gu, df_blk_gate_, B, df_cfg_.ffn, H, stream_);
+    ink2::launch_linear(cublas_, df_blk_gate_, L.down_proj.d_ptr, L.down_proj.f32, d_x_bf16_, df_blk_out_,
+                        B, H, df_cfg_.ffn, false, stream_);
+    ink2::launch_dflash_dyn_conv(df_blk_out_, df_blk_dyn_, static_cast<const __nv_bfloat16*>(L.mlp_conv_base.d_ptr),
+                                 df_blk_res_, df_blk_x_, B, H, df_cfg_.conv_group_size, true, stream_);
+  }
+
+  ink2::launch_rmsnorm(df_blk_x_, df_norm_.d_ptr, df_norm_.f32, df_blk_norm_, B, H, df_cfg_.rms_eps, stream_);
+  const float* h_prop = df_blk_norm_ + size_t(H);
+  if (!dflash_q8_head_ && unembed_.d_ptr) {
+    ink2::launch_linear(cublas_, h_prop, unembed_.d_ptr, unembed_.f32, d_x_bf16_, df_logits_, Kd, V, H, false, stream_);
+  } else if (d_unembed_q8_) {
+    ink2::launch_linear_q8_32(h_prop, d_unembed_q8_, d_unembed_q8_sc_, df_logits_, Kd, V, H, stream_);
+  } else if (d_screen_q8_) {
+    ink2::launch_screen_dot_multi(d_screen_q8_, d_screen_sc_, h_prop, df_logits_, Kd, V, H, stream_);
+  } else {
+    throw std::runtime_error("dflash: no output head buffer available");
+  }
+  if (!df_cfg_.after_correction && df_cfg_.logit_softcap > 0.0f) {
+    ink2::launch_softcap(df_logits_, Kd * V, df_cfg_.logit_softcap, stream_);
+  }
+  if (suppress_active_) ink2::launch_suppress_mask_rows(df_logits_, Kd, V, d_suppress_, stream_);
+
+  ink2::launch_linear(cublas_, h_prop, df_sel_hidden_proj_.d_ptr, df_sel_hidden_proj_.f32, d_x_bf16_,
+                      df_sel_h_, Kd, R, H, false, stream_);
+  ink2::launch_dflash_top16(df_logits_, Kd, V, df_top_tmp_vals_, df_top_tmp_ids_, df_cand_unary_, df_cand_ids_, stream_);
+
+  if (greedy) {
+    ink2::launch_dflash_select_chain_greedy(
+        d_tokens_, df_cand_ids_, df_cand_unary_, df_sel_h_,
+        static_cast<const __nv_bfloat16*>(df_pred_cb_.d_ptr),
+        static_cast<const __nv_bfloat16*>(df_succ_cb_.d_ptr),
+        d_tokens_, Kd, Ksel, R, df_cfg_.logit_softcap, df_cfg_.after_correction, stream_);
+  }
+  if (!greedy || compute_edges) {
+    ink2::launch_dflash_edge_table(
+        d_tokens_, df_cand_ids_, df_sel_h_,
+        static_cast<const __nv_bfloat16*>(df_pred_cb_.d_ptr),
+        static_cast<const __nv_bfloat16*>(df_succ_cb_.d_ptr),
+        df_edges_, Kd, Ksel, R, stream_);
+  }
+  if (!greedy) {
+    cuda_ok(cudaMemcpyAsync(h_df_cand_ids_, df_cand_ids_, size_t(Kd) * size_t(Ksel) * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, stream_), "copy df cand ids");
+    cuda_ok(cudaMemcpyAsync(h_df_cand_unary_, df_cand_unary_, size_t(Kd) * size_t(Ksel) * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream_), "copy df cand unary");
+    cuda_ok(cudaMemcpyAsync(h_df_edges_, df_edges_, size_t(Kd) * size_t(Ksel) * size_t(Ksel) * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream_), "copy df edges");
+    cuda_ok(cudaStreamSynchronize(stream_), "sync df sampled selector");
+    int pred_slot = 0;
+    for (int p = 0; p < Kd; ++p) {
+      const int row = (p == 0) ? 0 : pred_slot;
+      const float* urow = h_df_cand_unary_ + size_t(p) * size_t(Ksel);
+      const float* erow = h_df_edges_ + (size_t(p) * size_t(Ksel) + size_t(row)) * size_t(Ksel);
+      double w[16];
+      double max_s = -1e30;
+      for (int k = 0; k < Ksel; ++k) {
+        double raw = double(urow[k]) + double(erow[k]);
+        double s = (df_cfg_.after_correction && df_cfg_.logit_softcap > 0.0f)
+                       ? double(df_cfg_.logit_softcap) * std::tanh(raw / double(df_cfg_.logit_softcap))
+                       : raw;
+        w[k] = s;
+        if (s > max_s) max_s = s;
+      }
+      double sum_w = 0.0;
+      for (int k = 0; k < Ksel; ++k) {
+        w[k] = std::exp((w[k] - max_s) / double(temp_));
+        sum_w += w[k];
+      }
+      const double inv = sum_w > 0.0 ? (1.0 / sum_w) : 1.0;
+      float* prow = h_df_sparse_probs_ + size_t(p) * size_t(Ksel);
+      for (int k = 0; k < Ksel; ++k) prow[k] = float(w[k] * inv);
+      const double u = sample_uniform(seed_ ^ kSaltDraft, step_pos + p);
+      double run = 0.0;
+      int chosen = Ksel - 1;
+      for (int k = 0; k < Ksel - 1; ++k) {
+        run += double(prow[k]);
+        if (u < run) {
+          chosen = k;
+          break;
+        }
+      }
+      pred_slot = chosen;
+      h_pair_toks_[1 + p] = h_df_cand_ids_[size_t(p) * size_t(Ksel) + size_t(chosen)];
+    }
+    cuda_ok(cudaMemcpyAsync(d_tokens_ + 1, h_pair_toks_ + 1, size_t(Kd) * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, stream_), "upload df sampled toks");
+  }
+}
+
+void EngineInk2::dflash_debug_lattice(const int32_t* prompt, int n_prompt, int32_t* out_cand_ids,
+                                      float* out_unary, float* out_edges, int32_t* out_proposals) {
+  if (!dflash_enabled_) throw std::runtime_error("dflash_debug_lattice: DFlash2 is not enabled");
+  if (!prompt || n_prompt <= 0) throw std::runtime_error("dflash_debug_lattice: empty prompt");
+  reset();
+  const int32_t anchor = prefill(prompt, n_prompt);
+  const int Kd = df_cfg_.block - 1;
+  const int Ksel = df_cfg_.selector_top_k;
+  cuda_ok(cudaMemcpyAsync(d_tokens_, &anchor, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload dbg anchor");
+  dflash_draft_step(pos_, Kd, nullptr, true, pos_, true);
+  cuda_ok(cudaMemcpyAsync(out_cand_ids, df_cand_ids_, size_t(Kd) * size_t(Ksel) * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost, stream_), "copy dbg cands");
+  cuda_ok(cudaMemcpyAsync(out_unary, df_cand_unary_, size_t(Kd) * size_t(Ksel) * sizeof(float),
+                          cudaMemcpyDeviceToHost, stream_), "copy dbg unary");
+  cuda_ok(cudaMemcpyAsync(out_edges, df_edges_, size_t(Kd) * size_t(Ksel) * size_t(Ksel) * sizeof(float),
+                          cudaMemcpyDeviceToHost, stream_), "copy dbg edges");
+  cuda_ok(cudaMemcpyAsync(out_proposals, d_tokens_ + 1, size_t(Kd) * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost, stream_), "copy dbg proposals");
+  cuda_ok(cudaStreamSynchronize(stream_), "sync dbg lattice");
+}
+
 int32_t EngineInk2::sample_logits_row(const float* h_row, int64_t step_pos) const {
   return draw_from_dist(build_row_dist(h_row, cfg_.vocab, temp_, top_k_, top_p_, min_p_), seed_, step_pos);
 }
@@ -2384,8 +2977,9 @@ int32_t EngineInk2::prefill(const int32_t* ids, int n) {
   while (off < n) {
     const int c = std::min(kPrefillChunk, n - off);
     const bool last = (off + c == n);
-    forward_tokens(ids + off, c, pos_, last, mtp_enabled_, false, false);
+    forward_tokens(ids + off, c, pos_, last, any_draft_enabled(), false, false);
     if (mtp_enabled_) commit_mtp_context(pos_, c, nullptr, false);
+    else if (dflash_enabled_) commit_dflash_context(pos_, c, nullptr, false);
     pos_ += c;
     off += c;
   }
@@ -2398,8 +2992,9 @@ void EngineInk2::decode(int32_t* out, int steps) {
   if (last_tok_ < 0) throw std::runtime_error("decode called before prefill");
   for (int i = 0; i < steps; ++i) {
     const int32_t tok = last_tok_;
-    forward_tokens(&tok, 1, pos_, true, mtp_enabled_, false, false);
+    forward_tokens(&tok, 1, pos_, true, any_draft_enabled(), false, false);
     if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
+    else if (dflash_enabled_) commit_dflash_context(pos_, 1, nullptr, false);
     ++pos_;
     live_tokens_.push_back(tok);
     last_tok_ = sample_logits(pos_);
@@ -2441,8 +3036,9 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     if (cancel && cancel->load(std::memory_order_relaxed)) break;
     const int c = std::min(kPrefillChunk, rem - off);
     const bool last = (off + c == rem);
-    forward_tokens(prompt + cached + off, c, pos_, last, mtp_enabled_, false, false);
+    forward_tokens(prompt + cached + off, c, pos_, last, any_draft_enabled(), false, false);
     if (mtp_enabled_) commit_mtp_context(pos_, c, nullptr, false);
+    else if (dflash_enabled_) commit_dflash_context(pos_, c, nullptr, false);
     pos_ += c;
     off += c;
     ++passes;
@@ -2502,17 +3098,21 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
       const int r_idx = restore_conv ? 1 : 0;
       const int32_t cp = int32_t(p0);
       cuda_ok(cudaMemcpyAsync(d_commit_pos_, &cp, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload commit pos");
-      if (!commit_graph_exec_[r_idx][m - 1]) {
+      cudaGraph_t& cg = dflash_enabled_ ? df_commit_graph_[r_idx][m - 1] : commit_graph_[r_idx][m - 1];
+      cudaGraphExec_t& cge = dflash_enabled_ ? df_commit_graph_exec_[r_idx][m - 1] : commit_graph_exec_[r_idx][m - 1];
+      if (!cge) {
         cuda_ok(cudaStreamSynchronize(stream_), "sync before commit graph");
         cuda_ok(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin commit graph");
-        commit_mtp_context(0, m, d_commit_pos_, restore_conv);
-        cuda_ok(cudaStreamEndCapture(stream_, &commit_graph_[r_idx][m - 1]), "end commit graph");
-        cuda_ok(cudaGraphInstantiate(&commit_graph_exec_[r_idx][m - 1], commit_graph_[r_idx][m - 1], nullptr, nullptr, 0),
+        if (dflash_enabled_) commit_dflash_context(0, m, d_commit_pos_, restore_conv);
+        else commit_mtp_context(0, m, d_commit_pos_, restore_conv);
+        cuda_ok(cudaStreamEndCapture(stream_, &cg), "end commit graph");
+        cuda_ok(cudaGraphInstantiate(&cge, cg, nullptr, nullptr, 0),
                 "instantiate commit graph");
       }
-      cuda_ok(cudaGraphLaunch(commit_graph_exec_[r_idx][m - 1], stream_), "launch commit graph");
+      cuda_ok(cudaGraphLaunch(cge, stream_), "launch commit graph");
     } else {
-      commit_mtp_context(p0, m, nullptr, restore_conv);
+      if (dflash_enabled_) commit_dflash_context(p0, m, nullptr, restore_conv);
+      else commit_mtp_context(p0, m, nullptr, restore_conv);
     }
   };
   auto flush_pending = [&]() {
@@ -2529,7 +3129,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     const int room = (max_ctx_ - 2) - pos_;
     if (room < 0) break;
     const bool greedy = (temp_ <= 0.0f || top_k_ == 1);
-    const bool can_mtp = (mtp_enabled_ && rem_gen >= 2 && room >= 1);
+    const bool can_mtp = (any_draft_enabled() && rem_gen >= 2 && room >= 1);
 
     if (!can_mtp) {
       if (pend_m > 0) {
@@ -2537,13 +3137,13 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
         pend_m = 0;
       }
       const bool use_scr = greedy && use_screen_head_;
-      forward_tokens(&cur, 1, pos_, true, mtp_enabled_, false, false, nullptr, use_scr);
+      forward_tokens(&cur, 1, pos_, true, any_draft_enabled(), false, false, nullptr, use_scr);
       int32_t nxt = 0;
       if (use_scr) {
         cuda_ok(cudaMemcpyAsync(h_tok_, d_tok_out_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_), "copy tok");
         cuda_ok(cudaStreamSynchronize(stream_), "sync screen argmax");
         nxt = *h_tok_;
-        if (mtp_enabled_) {
+        if (any_draft_enabled()) {
           pend_p0 = pos_;
           pend_m = 1;
           pend_restore_conv = false;
@@ -2553,6 +3153,7 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
         ++passes;
       } else {
         if (mtp_enabled_) commit_mtp_context(pos_, 1, nullptr, false);
+        else if (dflash_enabled_) commit_dflash_context(pos_, 1, nullptr, false);
         ++pos_;
         live_tokens_.push_back(cur);
         ++passes;
@@ -2751,7 +3352,8 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
       }
     }
 
-    const int Kd = std::min({k_cur, kMtpBlock - 1, rem_gen - 1, room});
+    const int Kd = dflash_enabled_ ? std::min({dflash_k_, df_cfg_.block - 1, rem_gen - 1, room})
+                                 : std::min({k_cur, kMtpBlock - 1, rem_gen - 1, room});
     const int R = Kd + 1;
     const int V = cfg_.vocab;
     h_pair_toks_[0] = cur;
@@ -2763,16 +3365,19 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
       cuda_ok(cudaMemcpyAsync(d_step_pos_, &sp, sizeof(int32_t), cudaMemcpyHostToDevice, stream_), "upload step pos");
       const int gidx = Kd - 1;
       const int sup_idx = suppress_active_ ? 1 : 0;
-      if (!dv_graph_exec_[gidx][sup_idx]) {
+      cudaGraph_t& dvg = dflash_enabled_ ? df_dv_graph_[gidx][sup_idx] : dv_graph_[gidx][sup_idx];
+      cudaGraphExec_t& dvge = dflash_enabled_ ? df_dv_graph_exec_[gidx][sup_idx] : dv_graph_exec_[gidx][sup_idx];
+      if (!dvge) {
         cuda_ok(cudaStreamSynchronize(stream_), "sync before dv graph");
         cuda_ok(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin dv graph");
-        mtp_draft_step(0, Kd, d_step_pos_, true, step_ctr);
+        if (dflash_enabled_) dflash_draft_step(0, Kd, d_step_pos_, true, step_ctr);
+        else mtp_draft_step(0, Kd, d_step_pos_, true, step_ctr);
         mtp_verify_step(0, R, d_step_pos_, true);
-        cuda_ok(cudaStreamEndCapture(stream_, &dv_graph_[gidx][sup_idx]), "end dv graph");
-        cuda_ok(cudaGraphInstantiate(&dv_graph_exec_[gidx][sup_idx], dv_graph_[gidx][sup_idx], nullptr, nullptr, 0),
+        cuda_ok(cudaStreamEndCapture(stream_, &dvg), "end dv graph");
+        cuda_ok(cudaGraphInstantiate(&dvge, dvg, nullptr, nullptr, 0),
                 "instantiate dv graph");
       }
-      cuda_ok(cudaGraphLaunch(dv_graph_exec_[gidx][sup_idx], stream_), "launch dv graph");
+      cuda_ok(cudaGraphLaunch(dvge, stream_), "launch dv graph");
       cuda_ok(cudaMemcpyAsync(h_pair_toks_ + 1, d_tokens_ + 1, size_t(Kd) * sizeof(int32_t), cudaMemcpyDeviceToHost,
                               stream_),
               "copy drafts");
@@ -2781,7 +3386,8 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
               "copy verify samples");
       cuda_ok(cudaStreamSynchronize(stream_), "sync dv graph");
     } else {
-      mtp_draft_step(pos_, Kd, nullptr, greedy, step_ctr);
+      if (dflash_enabled_) dflash_draft_step(pos_, Kd, nullptr, greedy, step_ctr);
+      else mtp_draft_step(pos_, Kd, nullptr, greedy, step_ctr);
       mtp_verify_step(pos_, R, nullptr, greedy);
       if (greedy) {
         cuda_ok(cudaMemcpyAsync(h_pair_toks_ + 1, d_tokens_ + 1, size_t(Kd) * sizeof(int32_t),
@@ -2799,8 +3405,13 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     }
 
     int32_t accepted_out[kMtpBlock];
-    const int a = ink2_accept_tokens(accepted_out, h_pair_toks_ + 1, Kd, V, h_verify_logits_, h_mtp_draft_logits_,
-                                     h_pair_toks_ + kMtpBlock, temp_, top_k_, top_p_, min_p_, seed_, step_ctr);
+    const int a = (dflash_enabled_ && !greedy)
+                      ? ink2_accept_tokens_sparse(accepted_out, h_pair_toks_ + 1, Kd, V, h_verify_logits_,
+                                                  h_df_cand_ids_, h_df_sparse_probs_, df_cfg_.selector_top_k,
+                                                  h_pair_toks_ + kMtpBlock, temp_, top_k_, top_p_, min_p_, seed_,
+                                                  step_ctr)
+                      : ink2_accept_tokens(accepted_out, h_pair_toks_ + 1, Kd, V, h_verify_logits_, h_mtp_draft_logits_,
+                                           h_pair_toks_ + kMtpBlock, temp_, top_k_, top_p_, min_p_, seed_, step_ctr);
     st.drafted += Kd;
     st.accepted += a;
     ++passes;
@@ -2831,9 +3442,11 @@ void EngineInk2::generate(const int32_t* prompt, int n_prompt, int n_gen, int eo
     cur = next_cur;
 
     if (st.eos) break;
-    ema_hits = ema_hits * 0.85f + float(a);
-    ema_trials = ema_trials * 0.85f + float(std::min(Kd, a + 1));
-    k_cur = choose_k(ema_hits, ema_trials);
+    if (!dflash_enabled_) {
+      ema_hits = ema_hits * 0.85f + float(a);
+      ema_trials = ema_trials * 0.85f + float(std::min(Kd, a + 1));
+      k_cur = choose_k(ema_hits, ema_trials);
+    }
   }
   flush_pending();
   const auto t2 = clk::now();
